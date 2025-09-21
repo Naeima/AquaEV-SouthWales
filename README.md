@@ -30,7 +30,7 @@ Chargers are visualised with overlays for flood zones, live warnings, and weathe
 
 ## Screenshots  
 
-### Full dashboard with flood overlays and journey simulator  
+### Dashboard with flood overlays, journey simulator and weather forecast  
 ![AquaEV Dashboard](AquaEV.png)  
 
 ---
