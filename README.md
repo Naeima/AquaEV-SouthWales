@@ -53,7 +53,7 @@ Contains OS data © Crown copyright and database right.[Flood Risk Assessment Wa
 
 ## Repository contents  
 - `ons_evapp.py` — single-file Dash app with Folium map, routing, flood overlays, and chatbot interface.  
-- `assets/aquaev-dashboard.png` — screenshot of the main dashboard.  
+- `AquaEVpng` — screenshot of the main dashboard.  
 
 ---
 
