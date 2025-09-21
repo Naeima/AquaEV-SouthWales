@@ -1,80 +1,58 @@
+# AquaEV — South Wales  
+A Dash app that maps EV charging points across South Wales and overlays Welsh Government flood data, live NRW warnings, weather forecasts, and routing analytics.  
 
+# EV Chargers & Flood Risk — South Wales  
 
-# AquaEV: Flood-Aware EV Journey Planning for South Wales
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)  
+[![Dash](https://img.shields.io/badge/Dash-2.x-brightgreen.svg)](https://dash.plotly.com/)  
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)  
+[![OGL v3.0](https://img.shields.io/badge/Data%20License-OGL--UK--3.0-lightgrey.svg)](http://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/)  
+[![ODbL](https://img.shields.io/badge/Data%20License-ODbL-orange.svg)](https://www.openstreetmap.org/copyright)  
 
-## 🌍 Research Highlights
-AquaEV is a decision-support dashboard designed to help EV users in South Wales plan safe journeys during flood events.  
-The dashboard integrates:
-- Welsh Government flood-risk maps (FRAW, FMfP, live warnings)  
-- UK National ChargePoint Registry charging station data  
-- Weather forecasts (Met Office DataHub, Open-Meteo, 24-hour)  
+A Dash + Folium web app that integrates:  
+- **Welsh Government flood-risk maps** (FRAW, FMfP, live warnings via GeoServer).  
+- **UK National ChargePoint Registry (NCR) data** for public EV chargers.  
+- **Met Office DataHub and Open-Meteo forecasts** for 24-hour conditions.  
+- **Journey simulator** with exact RCSP routing + fallback OSRM.  
+- **Chatbot explanations** for transparency and scenario testing.  
 
-Users can input journey destinations, battery charge status, and generate downloadable routes.
-
----
-
-## 🎯 Science Objective
-To integrate and visualise diverse datasets for South Wales (UK), enabling a decision-support dashboard that:  
-- Supports **stakeholder planning** for resilient infrastructure.  
-- Allows **EV users** to self-serve real-time data for safe journey planning during extreme events.  
-
----
-
-## ⚙️ Approach
-1. **Data Sources**
-   - EV chargers: UK National ChargePoint Registry (filtered to South Wales).  
-   - Flood data: Welsh Government GeoServer (FRAW, FMfP, live warnings from NRW).  
-   - Weather data: Met Office DataHub and Open-Meteo.  
-
-2. **Integration**
-   - Semantic Knowledge Graphs fuse heterogeneous datasets (EV, flood, weather).  
-   - Conversational AI enables natural-language queries, scenario exploration, and transparent explanations.  
-
-3. **Routing Engine**
-   - **Exact mode:** Resource-Constrained Shortest Path (RCSP) solver over OSMnx-derived graphs.  
-   - **Fallback mode:** Open Source Routing Machine (OSRM) API.  
-   - Penalties applied to flood-exposed road segments.  
+Chargers are visualised with overlays for flood zones, live warnings, and weather impact.  
 
 ---
 
-## 🚗 Scenario Example
-**Inputs:**  
-- Start: Cardiff City Centre  
-- Destination: Swansea Marina  
-- Battery: 40% (≈90 km range)  
-
-**Steps:**  
-- Direct motorway route (M4) flagged due to flood closure near Port Talbot.  
-- Simulator queries charging stations on alternative routes.  
-- Suggests diversion via A48 with safe recharge stop at Bridgend (outside flood zone).  
-
-**Chatbot explanation:**  
-> “Direct route via M4 has flood closure near Port Talbot. Based on your battery status (40%), I recommend diverting via A48 and recharging at Bridgend station, which is currently outside flood risk zones.”  
+## Attribution  
+- Contains Natural Resources Wales information © Natural Resources Wales and database right.  
+- Contains data from the UK National ChargePoint Registry © OZEV.  
+- Weather data © Met Office DataHub / Open-Meteo.  
+- Contains OS data © Crown copyright and database right.  
 
 ---
 
-## 📊 Impact
-- Advances **flood-aware transport planning** by integrating EV, flood, and weather data.  
-- Optimises routing and charging strategies under extreme weather.  
-- Provides **transparent, natural-language insights** via chatbot for planners and drivers.  
-- Empowers drivers with **real-time decision support** to balance energy and risk.  
-- Informs **data-driven investments** and emergency planning.  
-- Offers a **transferable framework** for other flood-prone regions worldwide.  
+## Screenshots  
+
+### Full dashboard with flood overlays and journey simulator  
+![AquaEV Dashboard](assets/aquaev-dashboard.png)  
 
 ---
 
-## 📝 Summary
-AquaEV integrates EV charging, flood, and weather data into a unified dashboard.  
-It improves **resilience in South Wales**, supports **real-time driver safety**, and provides **evidence-based insights** for planners.  
-The approach is scalable and can be adapted to other regions.  
+## Features  
+- **Live flood overlays** (FRAW, FMfP, NRW warnings).  
+- **EV journey simulator**: RCSP solver (battery-aware) + fallback OSRM routes.  
+- **Flood-penalised routing** integrates SOC, range, and reserve margins.  
+- **Weather forecasts** from Met Office/Open-Meteo, shown alongside maps.  
+- **Interactive chatbot**: explains routing choices and risk exposure.  
+- **Downloadable routes** with summaries of time, distance, charging stops, and risk level.  
 
 ---
 
-## 📂 Repository Structure
+## Repository contents  
+- `ons_evapp.py` — single-file Dash app with Folium map, routing, flood overlays, and chatbot interface.  
+- `assets/aquaev-dashboard.png` — screenshot of the main dashboard.  
 
+---
 
-
-<p align="center">
-  <img src="aquaev-dashboard.png" alt="AquaEV — Decision Support Dashboard" width="900">
-  <br><em>Figure: AquaEV dashboard with flood overlays, journey simulator, and 24-hour forecast.</em>
-</p>
+## Installation  
+```bash
+git clone https://github.com/<your-repo>/aquaev-southwales.git
+cd aquaev-southwales
+pip install dash pandas geopandas folium shapely requests plotly osmnx
