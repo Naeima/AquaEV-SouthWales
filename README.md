@@ -31,7 +31,7 @@ Chargers are visualised with overlays for flood zones, live warnings, and weathe
 ## Screenshots  
 
 ### Full dashboard with flood overlays and journey simulator  
-![AquaEV Dashboard](assets/aquaev-dashboard.png)  
+![AquaEV Dashboard](aquaev-dashboard.png)  
 
 ---
 
@@ -53,6 +53,6 @@ Chargers are visualised with overlays for flood zones, live warnings, and weathe
 
 ## Installation  
 ```bash
-git clone https://github.com/<your-repo>/aquaev-southwales.git
-cd aquaev-southwales
+git clone https://github.com/Naeima/AquaEV.git
+cd AquaEV
 pip install dash pandas geopandas folium shapely requests plotly osmnx
