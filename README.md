@@ -1,4 +1,5 @@
-# AquaEV — South Wales  
+# AquaEV[South Wales] Towards a Decision Support Dashboard for Electric
+Vehicles Travel Planning During Extreme Events  
 A Dash app that maps EV charging points across South Wales and overlays Welsh Government flood data, live NRW warnings, weather forecasts, and routing analytics.  
 
 # EV Chargers & Flood Risk — South Wales  
