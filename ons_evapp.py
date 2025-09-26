@@ -16,7 +16,7 @@ from shapely.geometry import Point, LineString
 from shapely.ops import split as shp_split
 
 import folium
-from folium.plugins import MarkerCluster, Draw
+from folium.plugins import MarkerCluster, Draw, BeautifyIcon
 from folium.raster_layers import WmsTileLayer
 
 # Optional graph libs for exact optimiser
@@ -30,7 +30,7 @@ except Exception:
 # =========================
 # Config
 # =========================
-EV_GDRIVE_FILE_ID = "16xhVfgn4T4MEET_8ziEdBhs3nhpc_0PL"
+EV_GDRIVE_FILE_ID = "1RFtC5hSEIrg5yG1rkmfD8JasAK6h212K"  # https://drive.google.com/file/d/1RFtC5hSEIrg5yG1rkmfD8JasAK6h212K/view?usp=sharing
 LOCAL_EV_CSV = "south_wales_ev.csv"
 CACHE_DIR = ".cache_wfs"; os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -203,6 +203,15 @@ ZONE_COLORS = {
 ZONE_PRIORITY = ["Zone 3", "High", "Zone 2", "Medium", "Zone 1", "Low", "Very Low", "Outside", "Unknown"]
 _PRI = {z:i for i,z in enumerate(ZONE_PRIORITY)}
 
+def make_beautify_icon(color_hex: str):
+    border_map = {"#D32F2F":"#B71C1C", "#FFC107":"#FF8F00", "#2E7D32":"#1B5E20"}
+    border = border_map.get(color_hex, "#1B5E20")
+    return BeautifyIcon(
+        icon="bolt", icon_shape="marker",
+        background_color=color_hex, border_color=border, border_width=3,
+        text_color="white", inner_icon_style="font-size:22px;padding-top:2px;"
+    )
+
 def zone_to_icon(z: str) -> str:
     z = (z or "").strip()
     if z in ("Zone 3", "High"):   return "red"
@@ -279,8 +288,8 @@ area_col = 'adminArea' if 'adminArea' in df.columns else 'town'
 df[area_col] = df[area_col].astype(str).str.strip().str.title()
 df = df[df[area_col].isin([t.title() for t in TARGET_AREAS])].copy()
 
-df['Latitude']  = pd.to_numeric(df.get('latitude'), errors='coerce')
-df['Longitude'] = pd.to_numeric(df.get('longitude'), errors='coerce')
+df['Latitude']  = pd.to_numeric(df.get('latitude', df.get('Latitude')), errors='coerce')
+df['Longitude'] = pd.to_numeric(df.get('longitude', df.get('Longitude')), errors='coerce')
 df = df.dropna(subset=['Latitude','Longitude'])
 df['Town'] = df[area_col]
 
@@ -375,11 +384,14 @@ def rcsp_optimize(start_lat, start_lon, end_lat, end_lon,
     # Graph
     G = ox.graph_from_bbox(north, south, east, west, network_type="drive", simplify=True)
     G = ox.add_edge_speeds(G); G = ox.add_edge_travel_times(G)
-    _ = ox.project_graph(G, to_crs="EPSG:27700")
-    nodes, edges = ox.graph_to_gdfs(G, nodes=True, edges=True, node_geometry=True, fill_edge_geometry=True)
-    edges_m = edges.to_crs("EPSG:27700")
 
-    # Risk mark
+    # Project once for metrics
+    Gm = ox.project_graph(G, to_crs="EPSG:27700")
+    nodes_m, edges_m = ox.graph_to_gdfs(Gm, nodes=True, edges=True, node_geometry=True, fill_edge_geometry=True)
+    # Back to WGS84 edges (for attributes like travel_time), keep index alignment
+    nodes, edges = ox.graph_to_gdfs(G, nodes=True, edges=True, node_geometry=True, fill_edge_geometry=True)
+
+    # Risk mark (in metric CRS)
     if flood_union_m is not None:
         try:
             edges_m["risk"] = edges_m.geometry.buffer(0).intersects(flood_union_m.buffer(EXTREME_BUFFER_M if extreme else 0.0))
@@ -388,28 +400,32 @@ def rcsp_optimize(start_lat, start_lon, end_lat, end_lon,
     else:
         edges_m["risk"] = False
 
-    if "length" not in edges.columns:
-        edges["length"] = edges.geometry.length*0.0
-
+    # Robust edge length in metres from projected geometry
+    edges_m["length_m"] = edges_m.geometry.length.astype(float)
+    # Assemble lookup; prefer travel_time from OSRM-derived attributes
+    edges_join = edges.join(edges_m[["risk","length_m"]])
     edges_lookup = {}
-    joined = edges.join(edges_m[["risk"]])
-    for (u,v,k), row in joined.iterrows():
-        L = float(row.get("length", row.geometry.length*111000))
+    for (u,v,k), row in edges_join.iterrows():
+        L = float(row.get("length_m", 0.0))
+        if not L or not math.isfinite(L):
+            # conservative fallback (degrees → metres)
+            L = float(getattr(row, "length", 0.0)) * 111_000.0
         T = float(row.get("travel_time", L/13.9))
-        R = bool(row["risk"])
-        edges_lookup[(u,v,k)] = (L,T,R)
+        R = bool(row.get("risk", False))
+        edges_lookup[(u,v,k)] = (L, T, R)
 
+    # Nearest nodes
     u = ox.nearest_nodes(G, start_lon, start_lat)
     v = ox.nearest_nodes(G, end_lon, end_lat)
 
     # Chargers to nodes
     chargers = {}
-    if not chargers_df.empty:
+    if isinstance(chargers_df, (pd.DataFrame, gpd.GeoDataFrame)) and not chargers_df.empty:
         for _, r in chargers_df.iterrows():
             try:
-                nid = ox.nearest_nodes(G, r["Longitude"], r["Latitude"])
+                nid = ox.nearest_nodes(G, float(r["Longitude"]), float(r["Latitude"]))
                 chargers[nid] = dict(power_kW=DEFAULT_POWER_KW,
-                                     operational=(r.get("AvailabilityLabel","")=="Operational"))
+                                     operational=(str(r.get("AvailabilityLabel",""))=="Operational"))
             except Exception:
                 continue
 
@@ -417,7 +433,7 @@ def rcsp_optimize(start_lat, start_lon, end_lat, end_lon,
     step = SOC_STEP
     Q = [round(i*step,2) for i in range(0, int(1/step)+1)]
     def q_to_idx(q): return max(0, min(len(Q)-1, int(round(q/step))))
-    reserve_q = reserve_soc/100.0; tgt_q = target_soc/100.0; init_q = init_soc/100.0
+    reserve_q = float(reserve_soc)/100.0; tgt_q = float(target_soc)/100.0; init_q = float(init_soc)/100.0
 
     INF = 10**18
     best = {}; pred = {}
@@ -426,7 +442,7 @@ def rcsp_optimize(start_lat, start_lon, end_lat, end_lon,
     best[start_idx] = 0.0
     heapq.heappush(hq, (0.0, u, q_to_idx(init_q)))
 
-    # Collapse multiedges
+    # Collapse multiedges to fastest representative
     adj = {}
     for (uu,vv,kk), (L,T,R) in edges_lookup.items():
         cur = adj.get((uu,vv))
@@ -445,8 +461,8 @@ def rcsp_optimize(start_lat, start_lon, end_lat, end_lon,
 
         # Drive
         for (vv,L,T,R) in out.get(node, []):
-            E_kWh = (L/1000.0) * kwh_per_km
-            dq = E_kWh / battery_kwh
+            E_kWh = (L/1000.0) * float(kwh_per_km)
+            dq = E_kWh / float(battery_kwh)
             if Q[qi] - dq < reserve_q - 1e-9: continue
             qj = q_to_idx(max(reserve_q, Q[qi] - dq))
             new_cost = cost + T + (risk_penalty*(L/1000.0) if R else 0.0)
@@ -464,7 +480,7 @@ def rcsp_optimize(start_lat, start_lon, end_lat, end_lon,
             for dq_step in [CHARGE_STEP, 2*CHARGE_STEP, 3*CHARGE_STEP]:
                 q_next = min(1.0, Q[qi] + dq_step)
                 if q_next <= Q[qi] or q_next < max_target - 1e-9: continue
-                added_kWh = battery_kwh*(q_next - Q[qi])
+                added_kWh = float(battery_kwh)*(q_next - Q[qi])
                 charge_time_s = 3600.0 * (added_kWh / max(1e-6, p_kw))
                 key = (node, q_to_idx(q_next))
                 new_cost = cost + charge_time_s
@@ -497,7 +513,7 @@ def rcsp_optimize(start_lat, start_lon, end_lat, end_lon,
     safe_lines, risk_lines = segment_route_by_risk(line, flood_union_m,
                                                    buffer_m=(EXTREME_BUFFER_M if extreme else SIM_DEFAULTS["route_buffer_m"]))
     planned_stops = []
-    if not chargers_df.empty:
+    if isinstance(chargers_df, (pd.DataFrame, gpd.GeoDataFrame)) and not chargers_df.empty:
         for (nid, q_before, q_after, info) in charges:
             lat, lon = G.nodes[nid]['y'], G.nodes[nid]['x']
             try:
@@ -530,7 +546,6 @@ def add_live_wfs_popups(fmap, df_like):
                        style_function=lambda _: {'fillOpacity':0.15,'weight':2}).add_to(fmap)
 
 def add_base_tiles(m):
-    # OpenStreetMap (explicit URL + attribution)
     folium.TileLayer(
         tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
         name="OpenStreetMap",
@@ -538,8 +553,6 @@ def add_base_tiles(m):
         control=True,
         overlay=False, max_zoom=19
     ).add_to(m)
-
-    # CartoDB Positron / Dark Matter
     folium.TileLayer(
         tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
         name="CartoDB Positron",
@@ -552,16 +565,12 @@ def add_base_tiles(m):
         attr="© OpenStreetMap contributors, © CARTO",
         control=True, overlay=False, max_zoom=19
     ).add_to(m)
-
-    # OSM Humanitarian (use this instead of Stamen Terrain/Toner)
     folium.TileLayer(
         tiles="https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png",
         name="OSM Humanitarian",
         attr="© OpenStreetMap contributors, Tiles courtesy of HOT",
         control=True, overlay=False, max_zoom=19
     ).add_to(m)
-
-    # Esri World Imagery
     folium.TileLayer(
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/"
               "World_Imagery/MapServer/tile/{z}/{y}/{x}",
@@ -569,8 +578,6 @@ def add_base_tiles(m):
         attr="Tiles © Esri & contributors",
         control=True, overlay=False, max_zoom=19
     ).add_to(m)
-
-    # OpenTopoMap
     folium.TileLayer(
         tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
         name="OpenTopoMap",
@@ -578,31 +585,107 @@ def add_base_tiles(m):
         control=True, overlay=False, max_zoom=17
     ).add_to(m)
 
-# def add_base_tiles(m):
-#     folium.TileLayer("OpenStreetMap", name="OpenStreetMap", control=True).add_to(m)
-#     folium.TileLayer("CartoDB positron", name="CartoDB Positron", control=True).add_to(m)
-#     folium.TileLayer("CartoDB dark_matter", name="CartoDB Dark Matter", control=True).add_to(m)
-#     folium.TileLayer("Stamen Terrain", name="Stamen Terrain", control=True).add_to(m)
-#     folium.TileLayer("Stamen Toner", name="Stamen Toner", control=True).add_to(m)
-#     folium.TileLayer(
-#         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-#         attr="Esri WorldImagery", name="Esri WorldImagery", control=True,
-#         overlay=False, max_zoom=19).add_to(m)
-#     folium.TileLayer(
-#         tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
-#         attr="&copy; OpenTopoMap contributors", name="OpenTopoMap", control=True,
-#         overlay=False, max_zoom=17).add_to(m)
-
 # =========================
 # Rendering (icons by zone)
 # =========================
+def render_map_html_ev(df_map, show_fraw, show_fmfp, show_live, show_ctx, light=False):
+    m = folium.Map(location=[51.6,-3.2], zoom_start=9, tiles=None, control_scale=True)
+    add_base_tiles(m)
+
+    red_group   = folium.FeatureGroup(name="Chargers: Zone 3 / High (red)", show=True).add_to(m)
+    amber_group = folium.FeatureGroup(name="Chargers: Zone 2 / Medium (amber)", show=True).add_to(m)
+    green_group = folium.FeatureGroup(name="Chargers: Zone 1 / Low–Outside (green)", show=True).add_to(m)
+
+    red_cluster   = MarkerCluster(name="Cluster: Zone 3 / High").add_to(red_group)
+    amber_cluster = MarkerCluster(name="Cluster: Zone 2 / Medium").add_to(amber_group)
+    green_cluster = MarkerCluster(name="Cluster: Zone 1 / Low–Outside").add_to(green_group)
+
+    Draw(export=False, position='topleft',
+         draw_options={'polygon': {'allowIntersection': False, 'showArea': True},
+                       'rectangle': True, 'polyline': False, 'circle': False,
+                       'circlemarker': False, 'marker': False},
+         edit_options={'edit': True}).add_to(m)
+
+    for _, row in df_map.iterrows():
+        zlabel = (row.get("ZoneLabel") or "Outside")
+        if zlabel in ("Zone 3","High"):
+            color_hex = ZONE_COLORS["Zone 3"]; group_cluster = red_cluster
+        elif zlabel in ("Zone 2","Medium"):
+            color_hex = ZONE_COLORS["Zone 2"]; group_cluster = amber_cluster
+        else:
+            color_hex = ZONE_COLORS["Outside"]; group_cluster = green_cluster
+
+        title = f"{row.get('Operator','')} ({row.get('Town','')})"
+        try:
+            tooltip_html = _row_to_tooltip_html(row, title=title)
+            tooltip_obj = folium.Tooltip(tooltip_html, sticky=True)
+        except Exception:
+            tooltip_obj = title
+
+        marker = folium.Marker([row['Latitude'], row['Longitude']],
+                               tooltip=tooltip_obj,
+                               icon=make_beautify_icon(color_hex))
+        group_cluster.add_child(marker)
+
+    if show_fraw: add_wms_group(m, FRAW_WMS, True, 0.50)
+    if show_fmfp: add_wms_group(m, FMFP_WMS, True, 0.55)
+    if show_ctx:  add_wms_group(m, CONTEXT_WMS, False, 0.45)
+    if show_live:
+        add_wms_group(m, LIVE_WMS, True, 0.65)
+        if not light:
+            add_live_wfs_popups(m, df_map)
+
+    folium.LayerControl(collapsed=True).add_to(m)
+
+    legend_html = f"<div style='position: fixed; bottom:20px; left:20px; z-index:9999; background:white; padding:10px 12px; border:1px solid #ccc; border-radius:6px; font-size:13px;'>" \
+                  f"<b>Chargers by Flood Model Zone</b>" \
+                  f"<div style='margin-top:6px'><span style='display:inline-block;width:12px;height:12px;background:{ZONE_COLORS['Zone 3']};margin-right:6px;border:1px solid #555;'></span> Zone 3 / High</div>" \
+                  f"<div><span style='display:inline-block;width:12px;height:12px;background:{ZONE_COLORS['Zone 2']};margin-right:6px;border:1px solid #555;'></span> Zone 2 / Medium</div>" \
+                  f"<div><span style='display:inline-block;width:12px;height:12px;background:{ZONE_COLORS['Outside']};margin-right:6px;border:1px solid #555;'></span> Zone 1 / Low–Very Low / Outside</div>" \
+                  f"</div>"
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    return m.get_root().render()
+
 def render_map_html_route(full_line, route_safe, route_risk, start, end, chargers,
+                          all_chargers_df=None,  # <--- new argument
                           animate=False, speed_kmh=50, show_live_backdrops=False):
     m = folium.Map(location=[(start[0]+end[0])/2, (start[1]+end[1])/2], zoom_start=11,
                    tiles=None, control_scale=True)
     add_base_tiles(m)
-    cluster = MarkerCluster(name="Planned chargers").add_to(m)
 
+    # --- Plot all charging stations (clustered by risk zone) ---
+    if all_chargers_df is not None:
+        red_group   = folium.FeatureGroup(name="All Chargers: Zone 3 / High (red)", show=True).add_to(m)
+        amber_group = folium.FeatureGroup(name="All Chargers: Zone 2 / Medium (amber)", show=True).add_to(m)
+        green_group = folium.FeatureGroup(name="All Chargers: Zone 1 / Low–Outside (green)", show=True).add_to(m)
+
+        red_cluster   = MarkerCluster(name="Cluster: Zone 3 / High").add_to(red_group)
+        amber_cluster = MarkerCluster(name="Cluster: Zone 2 / Medium").add_to(amber_group)
+        green_cluster = MarkerCluster(name="Cluster: Zone 1 / Low–Outside").add_to(green_group)
+
+        for _, row in all_chargers_df.iterrows():
+            zlabel = (row.get("ZoneLabel") or "Outside")
+            if zlabel in ("Zone 3","High"):
+                color_hex = ZONE_COLORS["Zone 3"]; group_cluster = red_cluster
+            elif zlabel in ("Zone 2","Medium"):
+                color_hex = ZONE_COLORS["Zone 2"]; group_cluster = amber_cluster
+            else:
+                color_hex = ZONE_COLORS["Outside"]; group_cluster = green_cluster
+
+            title = f"{row.get('Operator','')} ({row.get('Town','')})"
+            try:
+                tooltip_html = _row_to_tooltip_html(row, title=title)
+                tooltip_obj = folium.Tooltip(tooltip_html, sticky=True)
+            except Exception:
+                tooltip_obj = title
+
+            marker = folium.Marker([row['Latitude'], row['Longitude']],
+                                   tooltip=tooltip_obj,
+                                   icon=make_beautify_icon(color_hex))
+            group_cluster.add_child(marker)
+
+    # Route lines
     def add_lines(lines, color, name):
         if not lines: return
         fg = folium.FeatureGroup(name=name).add_to(m)
@@ -610,26 +693,36 @@ def render_map_html_route(full_line, route_safe, route_risk, start, end, charger
             coords = [(lat,lon) for lon,lat in ln.coords]
             folium.PolyLine(coords, color=color, weight=6, opacity=0.9).add_to(fg)
 
+    # Whole route (faint for context)
+    if isinstance(full_line, LineString):
+        coords_full = [(lat,lon) for lon,lat in full_line.coords]
+        folium.PolyLine(coords_full, color="#999999", weight=3, opacity=0.5, tooltip="Planned route").add_to(m)
+
     add_lines(route_safe, "#2b8cbe", "Route – safe")
     add_lines(route_risk, "#e31a1c", "Route – flood risk")
     folium.Marker(start, tooltip="Start", icon=folium.Icon(color="green")).add_to(m)
     folium.Marker(end,   tooltip="End",   icon=folium.Icon(color="blue")).add_to(m)
 
+    # Highlight planned stops (simulate stops) on top (with bold border)
+    cluster = MarkerCluster(name="Planned route stops").add_to(m)
     for st in chargers:
-        row = gdf_ev.loc[gdf_ev["ROW_ID"].eq(st.get("ROW_ID",-1))].iloc[0] if "ROW_ID" in st else None
-        if row is None: continue
-        zlabel = row.get("ZoneLabel","Outside")
-        icon_col = zone_to_icon(zlabel)
-        popup = folium.Popup(
-            f"<b>{row.get('Operator','')}</b><br>{row.get('Town','')} {row.get('Postcode','')}"
-            f"<br><b>Flood model zone:</b> {zlabel}"
-            f"<br><b>Operational:</b> {st.get('Operational')}",
-            max_width=320
-        )
-        folium.Marker([row["Latitude"], row["Longitude"]],
-                      tooltip=f"{row.get('Operator','')} ({row.get('Town','')})",
-                      popup=popup,
-                      icon=folium.Icon(color=icon_col, icon="bolt", prefix="fa")).add_to(cluster)
+        try:
+            row = gdf_ev.loc[gdf_ev['ROW_ID'].eq(st.get('ROW_ID',-1))].iloc[0]
+        except Exception:
+            continue
+        zlabel = (row.get('ZoneLabel') or 'Outside')
+        if zlabel in ('Zone 3','High'):   color_hex = ZONE_COLORS['Zone 3']
+        elif zlabel in ('Zone 2','Medium'): color_hex = ZONE_COLORS['Zone 2']
+        else:                               color_hex = ZONE_COLORS['Outside']
+        title = f"{row.get('Operator','')} ({row.get('Town','')})"
+        try:
+            tooltip_html = _row_to_tooltip_html(row, title=title)
+            tooltip_obj = folium.Tooltip(tooltip_html, sticky=True)
+        except Exception:
+            tooltip_obj = title
+        # Mark planned stops with a bold border
+        folium.Marker([row['Latitude'], row['Longitude']], tooltip=tooltip_obj,
+                      icon=make_beautify_icon(color_hex)).add_to(cluster)
 
     if show_live_backdrops:
         add_wms_group(m, LIVE_WMS, visible=True, opacity=0.65)
@@ -647,53 +740,6 @@ def render_map_html_route(full_line, route_safe, route_risk, start, end, charger
     m.get_root().html.add_child(folium.Element(legend_html))
     return m.get_root().render()
 
-def render_map_html_ev(df_map, show_fraw, show_fmfp, show_live, show_ctx, light=False):
-    m = folium.Map(location=[51.6,-3.2], zoom_start=9, tiles=None, control_scale=True)
-    add_base_tiles(m)
-    cluster = MarkerCluster(name="EV Chargers").add_to(m)
-    Draw(export=False, position='topleft',
-         draw_options={'polygon': {'allowIntersection': False, 'showArea': True},
-                       'rectangle': True, 'polyline': False, 'circle': False,
-                       'circlemarker': False, 'marker': False},
-         edit_options={'edit': True}).add_to(m)
-
-    for _, row in df_map.iterrows():
-        zlabel = row.get("ZoneLabel", "Outside") or "Outside"
-        icon_col = zone_to_icon(zlabel)
-        parts = [
-            f"<b>Operator:</b> {row.get('Operator','EV')}",
-            f"<b>Status:</b> {row.get('AvailabilityLabel','Unknown')}",
-            f"<b>Flood model zone:</b> {zlabel}",
-        ]
-        if pd.notna(row.get('dateCreated', pd.NaT)): parts.append(f"<b>Installed:</b> {row['dateCreated']}")
-        folium.Marker([row['Latitude'], row['Longitude']],
-                      tooltip=f"{row.get('Operator','')} ({row.get('Town','')})",
-                      popup=folium.Popup("<br>".join(parts), max_width=320),
-                      icon=folium.Icon(color=icon_col, icon='bolt', prefix='fa')).add_to(cluster)
-
-    # Tile overlays are client-side; allow WMS tiles even in light mode.
-    if show_fraw: add_wms_group(m, FRAW_WMS, True, 0.50)
-    if show_fmfp: add_wms_group(m, FMFP_WMS, True, 0.55)
-    if show_ctx:  add_wms_group(m, CONTEXT_WMS, False, 0.45)
-
-    # WFS feature overlays (server fetch) — skip in light mode
-    if show_live and not light:
-        add_wms_group(m, LIVE_WMS, True, 0.65)
-        add_live_wfs_popups(m, df_map)
-    elif show_live:
-        add_wms_group(m, LIVE_WMS, True, 0.65)
-
-    folium.LayerControl(collapsed=True).add_to(m)
-
-    if light:
-        banner = """
-        <div style="position: fixed; top:18px; right:18px; z-index:9999; background:#fff3cd; color:#6c4f00;
-             padding:8px 10px; border:1px solid #ffe69c; border-radius:6px; font: 13px/1.3 system-ui, sans-serif;">
-          Light mode: zones & live WFS skipped. Click “Compute/Update zones” to enable.
-        </div>"""
-        m.get_root().html.add_child(folium.Element(banner))
-
-    return m.get_root().render()
 
 # =========================
 # Weather (Open-Meteo default; Met Office optional)
@@ -806,7 +852,9 @@ def build_kml(route_data: dict) -> str:
           <LineString><tessellate>1</tessellate><coordinates>{coord_str}</coordinates></LineString>
         </Placemark>"""
     def mk_pt(title, lat, lon, color_hex=None):
-        kml_color = "ff2e7d32" if color_hex is None else "ff" + "".join(reversed([color_hex[i:i+2] for i in (1,3,5)]))
+        k = color_hex or "#2E7D32"
+        # KML aabbggrr; hex input is #rrggbb
+        kml_color = "ff" + k[5:7] + k[3:5] + k[1:3]
         return f"""
         <Placemark>
           <name>{_kml_escape(title)}</name>
@@ -818,8 +866,9 @@ def build_kml(route_data: dict) -> str:
     if s: pts.append(mk_pt("Start", s["lat"], s["lon"], "#2E7D32"))
     if e: pts.append(mk_pt("End",   e["lat"], e["lon"], "#1f78b4"))
     for i, st in enumerate(route_data.get("stops") or [], 1):
-        title = st.get("name") or f"Stop {i}"
-        pts.append(mk_pt(title, st["lat"], st["lon"], "#FFC107"))
+            title = st.get("name") or f"Stop {i}"
+            color_hex = st.get("ZoneColor", "#2E7D32")
+            pts.append(mk_pt(title, st["lat"], st["lon"], color_hex))
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2">
@@ -833,12 +882,12 @@ def build_kml(route_data: dict) -> str:
 # ---------- Layout (iframe uses srcDoc now) ----------
 app.layout = html.Div([
     html.Div([
-        html.Img(src="/__logo", style={"height":"200px", "marginRight":"8px"}),  
+        html.Img(src="/__logo", style={"height":"200px", "marginRight":"8px"}),
         html.H1("AquaEV – Decision Support Dashboard",
-                style={"margin":"4"})
+                style={"margin":"4px"})
     ], style={"display":"flex","alignItems":"center","gap":"100px","marginBottom":"8px"}),
 
-    html.H2("A) Chargers & Flood Overlays", style={"margin":"24px 7 8px"}),
+    html.H2("A) Chargers & Flood Overlays", style={"margin":"24px 7px 8px"}),
     html.Div([
         html.Div([html.Label("Town(s)"),
             dcc.Dropdown(id="f-town",
@@ -1002,7 +1051,10 @@ def _update_map(towns, town_like, op_vals, layers_vals, light_vals, zones_json, 
     d["ZoneColor"] = d["ZoneColor"].fillna(ZONE_COLORS["Outside"])
 
     # Filters
-    if towns: d = d[d['Town'].isin(towns)]
+    if towns:
+        d = d[d['Town'].isin(towns)]
+    else:
+        d = gdf_ev.copy()  # Always plot all if nothing selected
     if town_like:
         s = str(town_like).strip().lower()
         if s: d = d[d['Town'].str.lower().str.contains(s, na=False)]
@@ -1018,7 +1070,7 @@ def _update_map(towns, town_like, op_vals, layers_vals, light_vals, zones_json, 
     layers_vals = set(layers_vals or [])
     show_fraw = "fraw" in layers_vals
     show_fmfp = "fmfp" in layers_vals
-    show_live = "live" in layers_vals and not light  # live WFS popups skipped in light mode
+    show_live = "live" in layers_vals
     show_ctx  = "ctx"  in layers_vals
 
     itinerary_children = html.Div()
@@ -1046,19 +1098,25 @@ def _update_map(towns, town_like, op_vals, layers_vals, light_vals, zones_json, 
                     extreme=(extreme and not light)
                 )
                 # enrich stops with coords + names for KML
+                
                 stop_features = []
                 for st in stops:
                     row = gdf_ev.loc[gdf_ev["ROW_ID"].eq(st["ROW_ID"])].iloc[0]
                     stop_features.append(dict(
-                        lat=float(row["Latitude"]), lon=float(row["Longitude"]),
-                        name=f"{row.get('Operator','')} ({row.get('Town','')})",
-                        desc=f"Postcode: {row.get('Postcode','')}; Zone: {row.get('ZoneLabel','Outside')}"
+                    lat=float(row["Latitude"]), lon=float(row["Longitude"]),
+                    name=f"{row.get('Operator','')} ({row.get('Town','')})",
+                    desc=f"Postcode: {row.get('Postcode','')}; Zone: {row.get('ZoneLabel','Outside')}",
+                    ZoneLabel=row.get('ZoneLabel', 'Outside'),
+                    ZoneColor=row.get('ZoneColor', ZONE_COLORS.get('Outside'))
                     ))
+                
 
                 html_str = render_map_html_route(
                     full_line=line, route_safe=safe_lines, route_risk=risk_lines,
                     start=(float(sla),float(slo)), end=(float(ela),float(elo)),
-                    chargers=stops, animate=animate, speed_kmh=speed,
+                    chargers=stops,
+    all_chargers_df=None,  # <--- new argument
+                    animate=animate, speed_kmh=speed,
                     show_live_backdrops=(extreme and not light)
                 )
                 rows = [f"**Exact (graph/DP)** — generalised cost ≈ {total_cost/60:.1f} min "
@@ -1087,7 +1145,9 @@ def _update_map(towns, town_like, op_vals, layers_vals, light_vals, zones_json, 
             html_str = render_map_html_route(
                 full_line=line, route_safe=safe_lines, route_risk=risk_lines,
                 start=(float(sla),float(slo)), end=(float(ela),float(elo)),
-                chargers=[], animate=animate, speed_kmh=speed,
+                chargers=[], 
+                all_chargers_df=d,  # <--- new argument
+                animate=animate, speed_kmh=speed,
                 show_live_backdrops=(extreme and not light)
             )
             itinerary_children = dcc.Markdown(
@@ -1113,11 +1173,16 @@ def _update_map(towns, town_like, op_vals, layers_vals, light_vals, zones_json, 
                 full_line=line, route_safe=[line], route_risk=[],
                 start=(float(sla or 51.5), float(slo or -3.2)),
                 end=(float(ela or 51.6), float(elo or -3.9)),
-                chargers=[], animate=False, speed_kmh=45, show_live_backdrops=False
+                chargers=[], 
+                all_chargers_df=d,  # <--- new argument
+                animate=False, speed_kmh=45, show_live_backdrops=False
             )
             itinerary_children = dcc.Markdown(f"**Simulation error:** {e}")
             return html_str, itinerary_children, {}
 
+    # EV overview
+    html_str = render_map_html_ev(d, show_fraw, show_fmfp, show_live, show_ctx, light=light)
+    return html_str, itinerary_children, {}
     # EV overview
     html_str = render_map_html_ev(d, show_fraw, show_fmfp, show_live, show_ctx, light=light)
     return html_str, itinerary_children, {}
@@ -1207,4 +1272,4 @@ def _download_kml(_n, route_data):
 # Run
 # -------------------------
 if __name__ == "__main__":
-    app.run_server(debug=True)
+    app.run(debug=True)
