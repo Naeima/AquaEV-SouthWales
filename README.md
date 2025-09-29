@@ -19,8 +19,7 @@ Chargers are visualised with overlays for flood zones, live warnings, and weathe
 
 ## Attribution  
 
-Contains Natural Resources Wales information © Natural Resources Wales and database right. All rights reserved.  
-Some features of this information are based on digital spatial data licensed from the UK Centre for Ecology & Hydrology © UKCEH. Defra, Met Office and DARD Rivers Agency © Crown copyright. ©Cranfield University. © James Hutton Institute. Contains OS data © Crown copyright and database right.[Flood Risk Assessment Wales (FRAW)](https://datamap.gov.wales/layergroups/inspire-nrw:FloodRiskAssessmentWales) [Open Government Licence v3.0](https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/)    
+Contains Natural Resources Wales information © Natural Resources Wales and database right. All rights reserved. Some features of this information are based on digital spatial data licensed from the UK Centre for Ecology & Hydrology © UKCEH. Defra, Met Office and DARD Rivers Agency © Crown copyright. ©Cranfield University. © James Hutton Institute. Contains OS data © Crown copyright and database right.[Flood Risk Assessment Wales (FRAW)](https://datamap.gov.wales/layergroups/inspire-nrw:FloodRiskAssessmentWales) [Open Government Licence v3.0](https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/)    
 - Contains data from the UK National ChargePoint Registry © OZEV.  
 - Weather data © Met Office DataHub / Open-Meteo.  
 - Contains OS data © Crown copyright and database right.  
