@@ -284,14 +284,13 @@ TARGET_AREAS = [
     "Monmouthshire","Neath Port Talbot","Newport","Pembrokeshire","Rhondda Cynon Taf",
     "Swansea","The Vale Of Glamorgan","Torfaen"
 ]
-area_col = 'adminArea' if 'adminArea' in df.columns else 'town'
+area_col = 'country' if 'country' in df.columns else ('adminArea' if 'adminArea' in df.columns else 'town')
 df[area_col] = df[area_col].astype(str).str.strip().str.title()
-df = df[df[area_col].isin([t.title() for t in TARGET_AREAS])].copy()
 
 df['Latitude']  = pd.to_numeric(df.get('latitude', df.get('Latitude')), errors='coerce')
 df['Longitude'] = pd.to_numeric(df.get('longitude', df.get('Longitude')), errors='coerce')
 df = df.dropna(subset=['Latitude','Longitude'])
-df['Town'] = df[area_col]
+df['country'] = df[area_col]
 
 def classify_availability(s):
     s = str(s).lower().strip()
@@ -309,7 +308,7 @@ df['dateCreated'] = pd.to_datetime(df.get('dateCreated', df.get('DateCreated')),
 df['geometry'] = [Point(xy) for xy in zip(df['Longitude'], df['Latitude'])]
 gdf_ev = gpd.GeoDataFrame(df, geometry='geometry', crs='EPSG:4326')
 gdf_ev['ROW_ID'] = gdf_ev.index.astype(int)
-TOWN_OPTIONS = sorted([t for t in gdf_ev['Town'].dropna().astype(str).unique() if t])
+country_OPTIONS = sorted([t for t in gdf_ev['country'].dropna().astype(str).unique() if t])
 
 # =========================
 # Routing helpers
@@ -615,7 +614,7 @@ def render_map_html_ev(df_map, show_fraw, show_fmfp, show_live, show_ctx, light=
         else:
             color_hex = ZONE_COLORS["Outside"]; group_cluster = green_cluster
 
-        title = f"{row.get('Operator','')} ({row.get('Town','')})"
+        title = f"{row.get('Operator','')} ({row.get('country','')})"
         try:
             tooltip_html = _row_to_tooltip_html(row, title=title)
             tooltip_obj = folium.Tooltip(tooltip_html, sticky=True)
@@ -673,7 +672,7 @@ def render_map_html_route(full_line, route_safe, route_risk, start, end, charger
             else:
                 color_hex = ZONE_COLORS["Outside"]; group_cluster = green_cluster
 
-            title = f"{row.get('Operator','')} ({row.get('Town','')})"
+            title = f"{row.get('Operator','')} ({row.get('country','')})"
             try:
                 tooltip_html = _row_to_tooltip_html(row, title=title)
                 tooltip_obj = folium.Tooltip(tooltip_html, sticky=True)
@@ -714,7 +713,7 @@ def render_map_html_route(full_line, route_safe, route_risk, start, end, charger
         if zlabel in ('Zone 3','High'):   color_hex = ZONE_COLORS['Zone 3']
         elif zlabel in ('Zone 2','Medium'): color_hex = ZONE_COLORS['Zone 2']
         else:                               color_hex = ZONE_COLORS['Outside']
-        title = f"{row.get('Operator','')} ({row.get('Town','')})"
+        title = f"{row.get('Operator','')} ({row.get('country','')})"
         try:
             tooltip_html = _row_to_tooltip_html(row, title=title)
             tooltip_obj = folium.Tooltip(tooltip_html, sticky=True)
@@ -889,12 +888,12 @@ app.layout = html.Div([
 
     html.H2("A) Chargers & Flood Overlays", style={"margin":"24px 7px 8px"}),
     html.Div([
-        html.Div([html.Label("Town(s)"),
-            dcc.Dropdown(id="f-town",
-                options=[{"label":t, "value":t} for t in TOWN_OPTIONS],
-                value=[], multi=True, placeholder="All towns")], style={"minWidth":"260px"}),
-        html.Div([html.Label("Town contains"),
-            dcc.Input(id="f-town-like", type="text", placeholder="substring", debounce=True)], style={"minWidth":"220px"}),
+        html.Div([html.Label("country(s)"),
+            dcc.Dropdown(id="f-country",
+                options=[{"label":t, "value":t} for t in country_OPTIONS],
+                value=[], multi=True, placeholder="All countrys")], style={"minWidth":"260px"}),
+        html.Div([html.Label("country contains"),
+            dcc.Input(id="f-country-like", type="text", placeholder="substring", debounce=True)], style={"minWidth":"220px"}),
         html.Div([html.Label("Operational"),
             dcc.Checklist(id="f-op",
                 options=[{"label":"Operational","value":"op"},
@@ -1000,8 +999,8 @@ def _compute_zones(_n):
     Output("itinerary", "children"),
     Output("store-route", "data"),
     # EV filters + overlays
-    Input("f-town", "value"),
-    Input("f-town-like", "value"),
+    Input("f-country", "value"),
+    Input("f-country-like", "value"),
     Input("f-op", "value"),
     Input("layers", "value"),
     Input("light", "value"),              # <-- Light/Incremental toggle
@@ -1022,7 +1021,7 @@ def _compute_zones(_n):
     # Trigger once on load
     Input("init","n_intervals"),
 )
-def _update_map(towns, town_like, op_vals, layers_vals, light_vals, zones_json, _tok,
+def _update_map(countrys, country_like, op_vals, layers_vals, light_vals, zones_json, _tok,
                 sim_clicks, sla, slo, ela, elo, batt, si, sres, stgt, kwhkm, maxoff, minleg,
                 use_rcsp, extreme_vals, animate_vals, speed_kmh, _init_n):
 
@@ -1051,13 +1050,13 @@ def _update_map(towns, town_like, op_vals, layers_vals, light_vals, zones_json, 
     d["ZoneColor"] = d["ZoneColor"].fillna(ZONE_COLORS["Outside"])
 
     # Filters
-    if towns:
-        d = d[d['Town'].isin(towns)]
+    if countrys:
+        d = d[d['country'].isin(countrys)]
     else:
         d = gdf_ev.copy()  # Always plot all if nothing selected
-    if town_like:
-        s = str(town_like).strip().lower()
-        if s: d = d[d['Town'].str.lower().str.contains(s, na=False)]
+    if country_like:
+        s = str(country_like).strip().lower()
+        if s: d = d[d['country'].str.lower().str.contains(s, na=False)]
     op_vals = set(op_vals or [])
     if op_vals and len(op_vals) < 3:
         mask = pd.Series(False, index=d.index)
@@ -1104,7 +1103,7 @@ def _update_map(towns, town_like, op_vals, layers_vals, light_vals, zones_json, 
                     row = gdf_ev.loc[gdf_ev["ROW_ID"].eq(st["ROW_ID"])].iloc[0]
                     stop_features.append(dict(
                     lat=float(row["Latitude"]), lon=float(row["Longitude"]),
-                    name=f"{row.get('Operator','')} ({row.get('Town','')})",
+                    name=f"{row.get('Operator','')} ({row.get('country','')})",
                     desc=f"Postcode: {row.get('Postcode','')}; Zone: {row.get('ZoneLabel','Outside')}",
                     ZoneLabel=row.get('ZoneLabel', 'Outside'),
                     ZoneColor=row.get('ZoneColor', ZONE_COLORS.get('Outside'))
@@ -1125,7 +1124,7 @@ def _update_map(towns, town_like, op_vals, layers_vals, light_vals, zones_json, 
                     rows.append("---")
                     for i, st in enumerate(stops, 1):
                         row = gdf_ev.loc[gdf_ev["ROW_ID"].eq(st["ROW_ID"])].iloc[0]
-                        rows.append(f"**Stop {i}** — {row.get('Operator','')} ({row.get('Town','')}) {row.get('Postcode','')} — Zone: {row.get('ZoneLabel','Outside')}")
+                        rows.append(f"**Stop {i}** — {row.get('Operator','')} ({row.get('country','')}) {row.get('Postcode','')} — Zone: {row.get('ZoneLabel','Outside')}")
                 itinerary_children = dcc.Markdown("\n\n".join(rows))
 
                 coords_latlng = [{"lat":lat, "lon":lon} for lon,lat in list(line.coords)]
