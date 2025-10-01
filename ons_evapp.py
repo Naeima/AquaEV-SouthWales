@@ -6,6 +6,8 @@ import io, os, time, json, tempfile, requests, math, heapq
 from io import StringIO, BytesIO
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import traceback
+
 
 import dash
 from dash import dcc, html, Input, Output, State
@@ -587,6 +589,13 @@ def add_base_tiles(m):
 # =========================
 # Rendering (icons by zone)
 # =========================
+
+def _row_to_tooltip_html(row, title=None):
+    s = f"<b>{title or 'Data Point'}</b><br>"
+    for k, v in row.items():
+        s += f"<b>{k}:</b> {v}<br>"
+    return s
+
 def render_map_html_ev(df_map, show_fraw, show_fmfp, show_live, show_ctx, light=False):
     m = folium.Map(location=[51.6,-3.2], zoom_start=9, tiles=None, control_scale=True)
     add_base_tiles(m)
@@ -1147,7 +1156,7 @@ def _update_map(countrys, country_like, op_vals, layers_vals, light_vals, zones_
                 chargers=[], 
                 all_chargers_df=d,  # <--- new argument
                 animate=animate, speed_kmh=speed,
-                show_live_backdrops=(extreme and not light)
+                show_live_backdrops=(extreme and not light)        
             )
             itinerary_children = dcc.Markdown(
                 f"**Fallback route:** {src} • ≈ {dist_m/1000.0:.1f} km • ≈ {dur_s/3600.0:.2f} h "
