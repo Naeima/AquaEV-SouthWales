@@ -54,3 +54,4 @@ Contains Natural Resources Wales information © Natural Resources Wales and data
 git clone https://github.com/Naeima/AquaEV.git
 cd AquaEV
 pip install dash pandas geopandas folium shapely requests plotly osmnx
+python app.py
