@@ -36,7 +36,7 @@ Contains Natural Resources Wales information © Natural Resources Wales and data
 ## Features  
 - **Live flood overlays** (FRAW, FMfP, NRW warnings).  
 - **EV journey simulator**: RCSP solver (battery-aware) + fallback OSRM routes.
-- ![RCSP Solver](RCSP.jpg)  
+  ![RCSP Solver](RCSP.jpg)  
 - **Flood-penalised routing** integrates SOC, range, and reserve margins.  
 - **Weather forecasts** from Met Office/Open-Meteo, shown alongside maps.  
 - **Interactive chatbot**: explains routing choices and risk exposure.  
