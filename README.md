@@ -1,6 +1,8 @@
-# AquaEV [South Wales]: Towards a Decision Support Dashboard for Electric Vehicles Travel Planning During Extreme Events
-Vehicles Travel Planning During Extreme Events  
-A Dash app that maps EV charging points across South Wales and overlays Welsh Government flood data, live NRW warnings, weather forecasts, and routing analytics.  
+# AquaEV [South Wales]: Towards a Support System for Electric Vehicles Travel Planning During Extreme Weather Events
+
+Vehicles Travel Planning During Extreme Weather Events  
+
+A decision support dashboard is proposed for South Wales in the United Kingdom to reduce range anxiety and enable safer and more resilient EV travel planning during extreme weather events. The dashboard integrates heterogeneous data sources, including the UK National ChargePoint Registry, Welsh Government flood-risk layers, and 24-hour forecasts from the Met Office DataHub and the Open-Meteo API as a fallback. Users specify trip origin, destination, and battery State-Of-Charge (SOC); the dashboard then simulates routes, highlights exposure risks, and recommends safe charging stops. Two routing modes are supported: an exact Resource Constrained Shortest Path (RCSP) solver, which provides charge-feasible routes that minimize travel time and flood exposure; and a fallback Open Source Routing Machine (OSRM) mode, which returns only the fastest path and overlays flood warnings, without guaranteeing feasibility or optimality. 
 
 # EV Chargers & Flood Risk — South Wales  
 
