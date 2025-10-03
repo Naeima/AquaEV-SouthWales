@@ -37,7 +37,8 @@ Contains Natural Resources Wales information © Natural Resources Wales and data
 - **Live flood overlays** (FRAW, FMfP, NRW warnings).  
 - **EV journey simulator**: RCSP solver (battery-aware) + fallback OSRM routes.
   ## Journey Simulator Steps
-
+  ![RCSP Solver](RCSP.jpg)
+  
 1. **Build the road network**
    - Model the map as a graph $G=(V,E)$ with nodes $V$ (intersections/chargers) 
      and edges $E$ (road segments).
@@ -78,8 +79,6 @@ Contains Natural Resources Wales information © Natural Resources Wales and data
    - For each candidate path, propagate SOC (step 2), insert charging (step 4), 
      and accumulate cost (steps 3 & 4).  
    - RCSP picks the feasible path/charging plan with minimum cost while avoiding flooded edges.
-
-  ![RCSP Solver](RCSP.jpg)  
 
 - **Weather forecasts** from Met Office/Open-Meteo, shown alongside maps.  
 - **Downloadable routes** with summaries of time, distance, charging stops, and risk level.  
