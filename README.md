@@ -80,9 +80,8 @@ Contains Natural Resources Wales information © Natural Resources Wales and data
    - RCSP picks the feasible path/charging plan with minimum cost while avoiding flooded edges.
 
   ![RCSP Solver](RCSP.jpg)  
-- **Flood-penalised routing** integrates SOC, range, and reserve margins.  
+
 - **Weather forecasts** from Met Office/Open-Meteo, shown alongside maps.  
-- **Interactive chatbot**: explains routing choices and risk exposure.  
 - **Downloadable routes** with summaries of time, distance, charging stops, and risk level.  
 
 ---
