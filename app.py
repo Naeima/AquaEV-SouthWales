@@ -1,3 +1,6 @@
+# Adapted from:
+# Naeima (2022). Correlation-between-Female-Fertility-and-Employment-Status.
+# GitHub repository: https://github.com/Naeima/Correlation-between-Female-Fertility-and-Employment-Status
 # dashboard_ev_merged_rcsp_zones_weather.py
 # Chargers coloured by FLOOD MODEL ZONE + Routing risk from ALL flood layers + Weather
 # Light/Incremental mode: fast startup with no WFS/WMS feature fetch until you opt in.
