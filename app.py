@@ -5,10 +5,6 @@
 # Chargers coloured by FLOOD MODEL ZONE + Routing risk from ALL flood layers + Weather
 # Light/Incremental mode: fast startup with no WFS/WMS feature fetch until you opt in.
 
-# dashboard_ev_merged_rcsp_zones_weather.py
-# Chargers coloured by FLOOD MODEL ZONE + Routing risk from ALL flood layers + Weather
-# Light/Incremental mode: fast startup with no WFS/WMS feature fetch until you opt in.
-
 import io, os, time, json, tempfile, requests, math, heapq, inspect
 from io import StringIO, BytesIO
 from requests.adapters import HTTPAdapter
