@@ -5,15 +5,20 @@
 # Chargers coloured by FLOOD MODEL ZONE + Routing risk from ALL flood layers + Weather
 # Light/Incremental mode: fast startup with no WFS/WMS feature fetch until you opt in.
 
-import io, os, time, json, tempfile, requests, math, heapq
+# dashboard_ev_merged_rcsp_zones_weather.py
+# Chargers coloured by FLOOD MODEL ZONE + Routing risk from ALL flood layers + Weather
+# Light/Incremental mode: fast startup with no WFS/WMS feature fetch until you opt in.
+
+import io, os, time, json, tempfile, requests, math, heapq, inspect
 from io import StringIO, BytesIO
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import traceback
-
+from dataclasses import dataclass, asdict
+from typing import List, Tuple
+import numpy as np
 
 import dash
-from dash import dcc, html, Input, Output, State
+from dash import Dash, dcc, html, Input, Output, State  
 from flask import Response
 import pandas as pd
 import geopandas as gpd
@@ -31,6 +36,49 @@ try:
     HAS_OSMNX = True
 except Exception:
     HAS_OSMNX = False
+# ---- Geocoding helpers: UK postcodes and general addresses ----
+def geocode_postcode_uk(pc: str):
+    """Fast UK postcode lookup (Postcodes.io). Returns (lat, lon) or None."""
+    try:
+        pc = (pc or "").strip()
+        if not pc:
+            return None
+        url = f"https://api.postcodes.io/postcodes/{requests.utils.quote(pc)}"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            j = r.json()
+            res = (j.get("result") or {})
+            lat = res.get("latitude"); lon = res.get("longitude")
+            if lat is not None and lon is not None:
+                return float(lat), float(lon)
+    except Exception:
+        pass
+    return None
+
+
+def geocode_text_osm(q: str):
+    """General forward geocoder (Nominatim). Returns (lat, lon) or None."""
+    try:
+        q = (q or "").strip()
+        if not q:
+            return None
+        url = "https://nominatim.openstreetmap.org/search"
+        params = {"q": q, "format": "jsonv2", "limit": 1, "addressdetails": 0}
+        r = requests.get(url, params=params, headers={"User-Agent": "CLEETS-EV/1.0"}, timeout=15)
+        if r.status_code == 200:
+            arr = r.json()
+            if arr:
+                return float(arr[0]["lat"]), float(arr[0]["lon"])
+    except Exception:
+        pass
+    return None
+
+
+def geocode_start_end(start_pc_or_text: str, end_pc_or_text: str):
+    """Try UK postcode first; fall back to OSM text search."""
+    s = geocode_postcode_uk(start_pc_or_text) or geocode_text_osm(start_pc_or_text)
+    e = geocode_postcode_uk(end_pc_or_text) or geocode_text_osm(end_pc_or_text)
+    return s, e
 
 # =========================
 # Config
@@ -89,7 +137,61 @@ DEFAULT_POWER_KW = 50.0
 BASE_RISK_PENALTY_PER_KM = 60.0   # sec/km
 EXTREME_RISK_PENALTY_PER_KM = 240.0
 EXTREME_BUFFER_M = 60.0
-MAX_GRAPH_BBOX_DEG = 0.25
+MAX_GRAPH_BBOX_DEG = 1.0
+ROUTE_BUFFER_M = 30                     # used when segmenting by flood risk
+
+ZONE_COLORS = {"Outside": "#2E7D32", "Zone 3":"#D32F2F", "Zone 2":"#FFC107", "Zone 1":"#2E7D32"}
+
+@dataclass
+class EVParams:
+    battery_kWh: float = 75.0
+    start_soc: float = 0.80
+    reserve_soc: float = 0.10
+    target_soc: float = 0.80
+    kWh_per_km: float = 0.20
+    max_charge_kW: float = 120.0
+
+@dataclass
+class StopInfo:
+    lat: float
+    lon: float
+    name: str = "Charger"
+    postcode: str = ""
+    ZoneLabel: str = "Outside"
+    ZoneColor: str = ZONE_COLORS["Outside"]
+    Operational: bool = True
+    soc_before: float = 0.0
+    soc_after: float = 0.0
+    energy_kWh: float = 0.0
+    charge_time_min: float = 0.0
+
+# -------------------------
+# Vehicle presets (category → model → specs)
+# kWh/km are typical mixed-cycle estimates; tweak freely.
+# -------------------------
+VEHICLE_PRESETS = {
+    "Hatchback": {
+        "Nissan Leaf 40":   {"battery_kWh": 40.0, "kWh_per_km": 0.16, "max_charge_kW": 50.0},
+        "Renault Zoe R135": {"battery_kWh": 52.0, "kWh_per_km": 0.15, "max_charge_kW": 50.0},
+        "VW ID.3 Pro":      {"battery_kWh": 58.0, "kWh_per_km": 0.16, "max_charge_kW": 120.0},
+    },
+    "Sedan": {
+        "Tesla Model 3 RWD":   {"battery_kWh": 57.5, "kWh_per_km": 0.145, "max_charge_kW": 170.0},
+        "Hyundai Ioniq 6":     {"battery_kWh": 77.4, "kWh_per_km": 0.14,  "max_charge_kW": 220.0},
+        "Polestar 2 Long":     {"battery_kWh": 82.0, "kWh_per_km": 0.17,  "max_charge_kW": 155.0},
+    },
+    "SUV / Crossover": {
+        "Kia EV6 RWD":         {"battery_kWh": 77.4, "kWh_per_km": 0.18, "max_charge_kW": 230.0},
+        "Hyundai Kona 64":     {"battery_kWh": 64.0, "kWh_per_km": 0.155,"max_charge_kW": 75.0},
+        "VW ID.4 Pro":         {"battery_kWh": 77.0, "kWh_per_km": 0.19, "max_charge_kW": 125.0},
+    },
+    "Van / MPV": {
+        "VW ID. Buzz":         {"battery_kWh": 77.0, "kWh_per_km": 0.23, "max_charge_kW": 170.0},
+        "Peugeot e-Traveller": {"battery_kWh": 75.0, "kWh_per_km": 0.26, "max_charge_kW": 100.0},
+        "Renault Kangoo E-Tech":{"battery_kWh": 45.0, "kWh_per_km": 0.20, "max_charge_kW": 80.0},
+    },
+}
+
 
 # =========================
 # Utilities
@@ -144,14 +246,27 @@ def read_bytes_resilient_gdrive(file_id_or_url: str) -> bytes:
         r = sess.get(url, params={"confirm":token}, timeout=30, stream=True); r.raise_for_status()
     return r.content
 
-def haversine_km(a,b):
-    R=6371.0088
-    lat1,lon1=math.radians(a[0]), math.radians(a[1])
-    lat2,lon2=math.radians(b[0]), math.radians(b[1])
-    dlat=lat2-lat1; dlon=lon2-lon1
-    h=math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
-    return 2*R*math.asin(math.sqrt(h))
+def haversine_km(lat1, lon1, lat2, lon2):
+    R = 6371.0088
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    return 2*R*math.asin(math.sqrt(a))
 
+def get_postcode(lat, lon):
+    """Reverse geocode using Nominatim (polite: ~1 req/sec)."""  # :contentReference[oaicite:4]{index=4}
+    try:
+        url = (f"https://nominatim.openstreetmap.org/reverse"
+               f"?format=jsonv2&lat={lat}&lon={lon}&zoom=18&addressdetails=1")
+        resp = requests.get(url, headers={"User-Agent": "ons-evapp/1.0"})
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("address", {}).get("postcode", "")
+        return ""
+    except Exception:
+        return ""
+    
 def bbox_expand(bounds, pad_m):
     minx,miny,maxx,maxy = bounds
     pad_deg = max(0.002, pad_m/111_320.0)
@@ -318,20 +433,65 @@ country_OPTIONS = sorted([t for t in gdf_ev['country'].dropna().astype(str).uniq
 # =========================
 # Routing helpers
 # =========================
+
+# --- Robust OSRM helpers (road polyline + basic turn text) ---
+def _requests_session_osrm():
+    s = requests.Session()
+    r = Retry(total=3, backoff_factor=0.6, status_forcelist=(429,500,502,503,504),
+              allowed_methods=frozenset(["GET"]))
+    s.mount("https://", HTTPAdapter(max_retries=r))
+    s.headers.update({"User-Agent": "CLEETS-EV/1.0"})
+    return s
+
+def _osrm_try(base_url, sl, so, el, eo, want_steps=True):
+    url = f"{base_url}/route/v1/driving/{so},{sl};{eo},{el}"
+    params = {"overview":"full","geometries":"geojson","alternatives":"false","steps": "true" if want_steps else "false"}
+    sess = _requests_session_osrm()
+    r = sess.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("routes"):
+        raise RuntimeError("No routes")
+    rt = data["routes"][0]
+    coords = rt["geometry"]["coordinates"]
+    ln = LineString([(x, y) for x, y in coords])
+    dist_m = float(rt["distance"])
+    dur_s  = float(rt["duration"])
+    steps = []
+    if want_steps:
+        for leg in rt.get("legs", []):
+            for st in leg.get("steps", []):
+                nm = st.get("name") or ""
+                m  = st.get("maneuver", {})
+                kind = m.get("modifier") or m.get("type") or ""
+                t = " ".join([w for w in [kind, nm] if w]).strip()
+                if t:
+                    steps.append(t)
+    return ln, dist_m, dur_s, steps
+
 def osrm_route(sl, so, el, eo):
-    url = f"https://router.project-osrm.org/route/v1/driving/{so},{sl};{eo},{el}"
-    params = {"overview":"full","geometries":"geojson","alternatives":"false","steps":"false"}
-    try:
-        r = requests.get(url, params=params, timeout=15).json()
-        if r.get("routes"):
-            coords = r["routes"][0]["geometry"]["coordinates"]
-            ln = LineString([(c[0],c[1]) for c in coords])
-            return ln, float(r["routes"][0]["distance"]), float(r["routes"][0]["duration"]), "OSRM"
-    except Exception:
-        pass
-    ln = LineString([(so,sl),(eo,el)])
-    d_km = haversine_km((sl,so),(el,eo))
-    return ln, d_km*1000.0, d_km/70.0*3600.0, "Great-circle (approx)"
+    for base in ("https://router.project-osrm.org", "https://routing.openstreetmap.de/routed-car"):
+        try:
+            ln, d, t, steps = _osrm_try(base, sl, so, el, eo, want_steps=True)
+            return ln, d, t, steps, base
+        except Exception:
+            continue
+    raise RuntimeError("OSRM routing failed on both endpoints")
+
+# def osrm_route(sl, so, el, eo):
+#     url = f"https://router.project-osrm.org/route/v1/driving/{so},{sl};{eo},{el}"
+#     params = {"overview":"full","geometries":"geojson","alternatives":"false","steps":"false"}
+#     try:
+#         r = requests.get(url, params=params, timeout=15).json()
+#         if r.get("routes"):
+#             coords = r["routes"][0]["geometry"]["coordinates"]
+#             ln = LineString([(c[0],c[1]) for c in coords])
+#             return ln, float(r["routes"][0]["distance"]), float(r["routes"][0]["duration"]), "OSRM"
+#     except Exception:
+#         pass
+#     ln = LineString([(so,sl),(eo,el)])
+#     d_km = haversine_km(sl, so, el, eo)
+#     return ln, d_km*1000.0, d_km/70.0*3600.0, "Great-circle (approx)"
 
 def get_flood_union(bounds, include_live=True, include_fraw=True, include_fmfp=True, pad_m=SIM_DEFAULTS["wfs_pad_m"]):
     bbox = bbox_expand(bounds, pad_m); chunks=[]
@@ -356,145 +516,267 @@ def get_flood_union(bounds, include_live=True, include_fraw=True, include_fmfp=T
     try: return G.to_crs('EPSG:27700').union_all()
     except Exception: return G.to_crs('EPSG:27700').unary_union
 
-def segment_route_by_risk(line_wgs84, risk_union_metric, buffer_m=30):
-    if risk_union_metric is None: return [line_wgs84], []
-    try: line_m = gpd.GeoSeries([line_wgs84], crs='EPSG:4326').to_crs('EPSG:27700').iloc[0]
-    except Exception: line_m = gpd.GeoSeries([line_wgs84], crs='EPSG:4326').to_crs('EPSG:3857').iloc[0]
+# def segment_route_by_risk(line_wgs84, risk_union_metric, buffer_m=30):
+#     if risk_union_metric is None: return [line_wgs84], []
+#     try: line_m = gpd.GeoSeries([line_wgs84], crs='EPSG:4326').to_crs('EPSG:27700').iloc[0]
+#     except Exception: line_m = gpd.GeoSeries([line_wgs84], crs='EPSG:4326').to_crs('EPSG:3857').iloc[0]
+#     hit = risk_union_metric.buffer(buffer_m)
+#     try: pieces = list(shp_split(line_m, hit.boundary))
+#     except Exception: pieces = [line_m]
+#     safe_m, risk_m = [], []
+#     for seg in pieces: (risk_m if seg.intersects(hit) else safe_m).append(seg)
+#     safe = gpd.GeoSeries(safe_m, crs='EPSG:27700').to_crs('EPSG:4326').tolist() if safe_m else []
+#     risk = gpd.GeoSeries(risk_m, crs='EPSG:27700').to_crs('EPSG:4326').tolist() if risk_m else []
+#     return safe, risk
+
+def segment_route_by_risk(line_wgs84, risk_union_metric, buffer_m=ROUTE_BUFFER_M):
+    """Split route into safe vs risk segments against a metric-union geometry."""
+    if risk_union_metric is None:
+        return [line_wgs84], []
+    try:
+        line_m = gpd.GeoSeries([line_wgs84], crs='EPSG:4326').to_crs('EPSG:27700').iloc[0]
+    except Exception:
+        line_m = gpd.GeoSeries([line_wgs84], crs='EPSG:4326').to_crs('EPSG:3857').iloc[0]
     hit = risk_union_metric.buffer(buffer_m)
-    try: pieces = list(shp_split(line_m, hit.boundary))
-    except Exception: pieces = [line_m]
+    try:
+        pieces = list(shp_split(line_m, hit.boundary))
+    except Exception:
+        pieces = [line_m]
     safe_m, risk_m = [], []
-    for seg in pieces: (risk_m if seg.intersects(hit) else safe_m).append(seg)
+    for seg in pieces:
+        (risk_m if seg.intersects(hit) else safe_m).append(seg)
     safe = gpd.GeoSeries(safe_m, crs='EPSG:27700').to_crs('EPSG:4326').tolist() if safe_m else []
     risk = gpd.GeoSeries(risk_m, crs='EPSG:27700').to_crs('EPSG:4326').tolist() if risk_m else []
     return safe, risk
 
+# =========================
+# Graph + charger fetch
+# =========================
+def fetch_graph_and_chargers(center_lat, center_lon, dist_m=15000):
+    """OSMnx graph + OSM charging POIs (amenity=charging_station)."""  # :contentReference[oaicite:5]{index=5}
+    G = ox.graph_from_point((center_lat, center_lon), dist=dist_m, network_type="drive", simplify=True)
+    try:
+        pois = ox.geometries_from_point((center_lat, center_lon),
+                                        tags={"amenity": "charging_station"}, dist=dist_m)
+        chargers = []
+        if not pois.empty:
+            for _, row in pois.iterrows():
+                geom = row.geometry
+                if geom is None:
+                    continue
+                pt = geom.centroid if hasattr(geom, "centroid") else geom
+                chargers.append({
+                    "Latitude":  float(pt.y),
+                    "Longitude": float(pt.x),
+                    "Name": row.get("name", "Charging station"),
+                    "ROW_ID": len(chargers)+1,
+                    "AvailabilityLabel": "Operational"
+                })
+        chargers_df = pd.DataFrame(chargers, columns=["ROW_ID","Latitude","Longitude","Name","AvailabilityLabel"])
+    except Exception:
+        chargers_df = pd.DataFrame(columns=["ROW_ID","Latitude","Longitude","Name","AvailabilityLabel"])
+    return G, chargers_df
+
+
+# RCSP optimiser
+
+
+def _build_graph_bbox(north, south, east, west):
+    """
+    Return a drive network graph for the given bbox, compatible with OSMnx
+    versions ≤1.8 (positional), ≥1.9 (keyword-only), and 2.x (bbox tuple).
+    """
+    # 1) Newer OSMnx (≥1.9): keyword-only north/south/east/west
+    try:
+        return ox.graph_from_bbox(
+            north=north, south=south, east=east, west=west,
+            network_type="drive", simplify=True
+        )
+    except TypeError:
+        pass
+
+    # 2) OSMnx variants expecting a single bbox tuple as first positional arg
+    try:
+        return ox.graph_from_bbox(
+            (north, south, east, west),
+            network_type="drive", simplify=True
+        )
+    except TypeError:
+        pass
+
+    # 3) Legacy OSMnx (≤1.8): positional arguments
+    try:
+        return ox.graph_from_bbox(north, south, east, west, "drive", True)
+    except TypeError as e:
+        raise RuntimeError(f"OSMnx graph_from_bbox signature not recognised: {e}")
+
+
+def _graph_two_points(sl, so, el, eo, dist_m=15000):
+    # Build two local graphs around start/end and merge them
+    G1 = ox.graph_from_point((sl, so), dist=dist_m, network_type="drive", simplify=True)
+    G2 = ox.graph_from_point((el, eo), dist=dist_m, network_type="drive", simplify=True)
+    try:
+        return nx.compose(G1, G2)
+    except Exception:
+        G = nx.MultiDiGraph()
+        G.update(G1); G.update(G2)
+        return G
+
+
 def rcsp_optimize(start_lat, start_lon, end_lat, end_lon,
                   battery_kwh, init_soc, reserve_soc, target_soc,
-                  kwh_per_km, chargers_df, flood_union_m,
-                  extreme=False):
+                  kwh_per_km, chargers_df, flood_union_m, extreme=False):
     if not HAS_OSMNX:
         raise RuntimeError("OSMnx not installed")
 
-    # Bbox
-    minlat, maxlat = sorted([start_lat, end_lat])
-    minlon, maxlon = sorted([start_lon, end_lon])
-    pad_deg = 0.05
-    south, north = minlat-pad_deg, maxlat+pad_deg
-    west,  east  = minlon-pad_deg, maxlon+pad_deg
-    if (east-west) > MAX_GRAPH_BBOX_DEG or (north-south) > MAX_GRAPH_BBOX_DEG:
-        raise RuntimeError("Area too large for local graph; zoom in or use OSRM fallback")
+    # ---- Build bounding box
+    minlat, maxlat = sorted([float(start_lat), float(end_lat)])
+    minlon, maxlon = sorted([float(start_lon), float(end_lon)])
+    pad = 0.05
+    south, north = minlat - pad, maxlat + pad
+    west,  east  = minlon - pad, maxlon + pad
 
-    # Graph
-    G = ox.graph_from_bbox(north, south, east, west, network_type="drive", simplify=True)
-    G = ox.add_edge_speeds(G); G = ox.add_edge_travel_times(G)
+    # Diagonal distance across bbox (km) → decide which graph strategy to use
+    diag_km = haversine_km(south, west, north, east)
 
-    # Project once for metrics
+    # Guard absurdly large areas by degrees too
+    if (east - west) > MAX_GRAPH_BBOX_DEG or (north - south) > MAX_GRAPH_BBOX_DEG:
+        # You can either raise or force the two-point strategy:
+        # raise RuntimeError("Area too large for local graph; use OSRM fallback")
+        G = _graph_two_points(start_lat, start_lon, end_lat, end_lon, dist_m=20000)
+    else:
+        # Long trips → cheaper to stitch two local graphs than a huge bbox
+        if diag_km > 60:
+            G = _graph_two_points(start_lat, start_lon, end_lat, end_lon, dist_m=20000)
+        else:
+            G = _build_graph_bbox(north, south, east, west)
+
+    # Speeds and travel time
+    G = ox.add_edge_speeds(G)
+    G = ox.add_edge_travel_times(G)
+
+    # ---- Project to metric CRS and get GeoDataFrames
     Gm = ox.project_graph(G, to_crs="EPSG:27700")
-    nodes_m, edges_m = ox.graph_to_gdfs(Gm, nodes=True, edges=True, node_geometry=True, fill_edge_geometry=True)
-    # Back to WGS84 edges (for attributes like travel_time), keep index alignment
-    nodes, edges = ox.graph_to_gdfs(G, nodes=True, edges=True, node_geometry=True, fill_edge_geometry=True)
+    nodes_m, edges_m = ox.graph_to_gdfs(Gm, nodes=True, edges=True,
+                                        node_geometry=True, fill_edge_geometry=True)
+    nodes,    edges  = ox.graph_to_gdfs(G,  nodes=True, edges=True,
+                                        node_geometry=True, fill_edge_geometry=True)
 
-    # Risk mark (in metric CRS)
+    # ---- Risk mark (buffer in metric CRS)
     if flood_union_m is not None:
         try:
-            edges_m["risk"] = edges_m.geometry.buffer(0).intersects(flood_union_m.buffer(EXTREME_BUFFER_M if extreme else 0.0))
+            buf = EXTREME_BUFFER_M if extreme else 0.0
+            edges_m["risk"] = edges_m.geometry.buffer(0).intersects(flood_union_m.buffer(buf))
         except Exception:
             edges_m["risk"] = False
     else:
         edges_m["risk"] = False
 
-    # Robust edge length in metres from projected geometry
+    # Length (m) in metric CRS
     edges_m["length_m"] = edges_m.geometry.length.astype(float)
-    # Assemble lookup; prefer travel_time from OSRM-derived attributes
-    edges_join = edges.join(edges_m[["risk","length_m"]])
+
+    # Join WGS84 attrs (incl. travel_time) with metric risk/length
+    edges_join = edges.join(edges_m[["risk", "length_m"]])
     edges_lookup = {}
-    for (u,v,k), row in edges_join.iterrows():
+    for (u, v, k), row in edges_join.iterrows():
         L = float(row.get("length_m", 0.0))
         if not L or not math.isfinite(L):
-            # conservative fallback (degrees → metres)
-            L = float(getattr(row, "length", 0.0)) * 111_000.0
-        T = float(row.get("travel_time", L/13.9))
+            L = float(getattr(row, "length", 0.0)) * 111_000.0  # conservative
+        T = float(row.get("travel_time", L / 13.9))             # ~50 km/h fallback
         R = bool(row.get("risk", False))
-        edges_lookup[(u,v,k)] = (L, T, R)
+        edges_lookup[(u, v, k)] = (L, T, R)
 
-    # Nearest nodes
-    u = ox.nearest_nodes(G, start_lon, start_lat)
-    v = ox.nearest_nodes(G, end_lon, end_lat)
+    # ---- Nearest graph nodes (API-compatible)
+    try:
+        nn = ox.nearest_nodes
+    except AttributeError:
+        from osmnx.distance import nearest_nodes as nn
 
-    # Chargers to nodes
+    u = nn(G, start_lon, start_lat)
+    v = nn(G, end_lon,   end_lat)
+
+    # ---- Map chargers to nearest nodes
     chargers = {}
     if isinstance(chargers_df, (pd.DataFrame, gpd.GeoDataFrame)) and not chargers_df.empty:
         for _, r in chargers_df.iterrows():
             try:
-                nid = ox.nearest_nodes(G, float(r["Longitude"]), float(r["Latitude"]))
+                nid = nn(G, float(r["Longitude"]), float(r["Latitude"]))
                 chargers[nid] = dict(power_kW=DEFAULT_POWER_KW,
-                                     operational=(str(r.get("AvailabilityLabel",""))=="Operational"))
+                                     operational=(str(r.get("AvailabilityLabel","")) == "Operational"))
             except Exception:
                 continue
 
-    # RCSP
+    # ---- RCSP over (node, discretised SOC)
     step = SOC_STEP
-    Q = [round(i*step,2) for i in range(0, int(1/step)+1)]
+    Q = [round(i * step, 2) for i in range(0, int(1 / step) + 1)]
     def q_to_idx(q): return max(0, min(len(Q)-1, int(round(q/step))))
-    reserve_q = float(reserve_soc)/100.0; tgt_q = float(target_soc)/100.0; init_q = float(init_soc)/100.0
+    reserve_q = float(reserve_soc)/100.0
+    tgt_q     = float(target_soc)/100.0
+    init_q    = float(init_soc)/100.0
 
     INF = 10**18
-    best = {}; pred = {}
+    best = {}
+    pred = {}
     hq = []
-    start_idx = (u, q_to_idx(init_q))
-    best[start_idx] = 0.0
+    start_key = (u, q_to_idx(init_q))
+    best[start_key] = 0.0
     heapq.heappush(hq, (0.0, u, q_to_idx(init_q)))
 
     # Collapse multiedges to fastest representative
-    adj = {}
-    for (uu,vv,kk), (L,T,R) in edges_lookup.items():
-        cur = adj.get((uu,vv))
+    adj_min = {}
+    for (uu, vv, kk), (L, T, R) in edges_lookup.items():
+        cur = adj_min.get((uu, vv))
         if (cur is None) or (T < cur[1]):
-            adj[(uu,vv)] = (L,T,R)
-    out = {}
-    for (uu,vv), (L,T,R) in adj.items():
-        out.setdefault(uu, []).append((vv,L,T,R))
+            adj_min[(uu, vv)] = (L, T, R)
+    adj = {}
+    for (uu, vv), (L, T, R) in adj_min.items():
+        adj.setdefault(uu, []).append((vv, L, T, R))
 
     risk_penalty = EXTREME_RISK_PENALTY_PER_KM if extreme else BASE_RISK_PENALTY_PER_KM
 
     while hq:
         cost, node, qi = heapq.heappop(hq)
-        if best.get((node,qi), INF) < cost - 1e-9: continue
-        if node == v and Q[qi] >= reserve_q: break
+        if best.get((node, qi), INF) < cost - 1e-9:
+            continue
+        if node == v and Q[qi] >= reserve_q:
+            break
 
-        # Drive
-        for (vv,L,T,R) in out.get(node, []):
+        # Drive transitions
+        for (vv, L, T, R) in adj.get(node, []):
             E_kWh = (L/1000.0) * float(kwh_per_km)
             dq = E_kWh / float(battery_kwh)
-            if Q[qi] - dq < reserve_q - 1e-9: continue
+            if Q[qi] - dq < reserve_q - 1e-9:
+                continue
             qj = q_to_idx(max(reserve_q, Q[qi] - dq))
-            new_cost = cost + T + (risk_penalty*(L/1000.0) if R else 0.0)
+            new_cost = cost + T + (risk_penalty * (L/1000.0) if R else 0.0)
             key = (vv, qj)
             if new_cost + 1e-9 < best.get(key, INF):
                 best[key] = new_cost
-                pred[key] = (node, qi, "drive", dict(L=L,T=T,R=R))
+                pred[key] = (node, qi, "drive", dict(L=L, T=T, R=R))
                 heapq.heappush(hq, (new_cost, vv, qj))
 
-        # Charge
+        # Charge transitions (only at charger nodes)
         ch = chargers.get(node)
         if ch and ch.get("operational", True):
             p_kw = float(ch.get("power_kW", DEFAULT_POWER_KW))
             max_target = max(tgt_q, Q[qi])
             for dq_step in [CHARGE_STEP, 2*CHARGE_STEP, 3*CHARGE_STEP]:
                 q_next = min(1.0, Q[qi] + dq_step)
-                if q_next <= Q[qi] or q_next < max_target - 1e-9: continue
-                added_kWh = float(battery_kwh)*(q_next - Q[qi])
+                if q_next <= Q[qi] or q_next < max_target - 1e-9:
+                    continue
+                added_kWh = float(battery_kwh) * (q_next - Q[qi])
                 charge_time_s = 3600.0 * (added_kWh / max(1e-6, p_kw))
                 key = (node, q_to_idx(q_next))
                 new_cost = cost + charge_time_s
                 if new_cost + 1e-9 < best.get(key, INF):
                     best[key] = new_cost
-                    pred[key] = (node, qi, "charge", dict(p_kW=p_kw, added_kWh=added_kWh, dt=charge_time_s))
+                    pred[key] = (node, qi, "charge",
+                                 dict(p_kW=p_kw, added_kWh=added_kWh, dt=charge_time_s))
                     heapq.heappush(hq, (new_cost, node, q_to_idx(q_next)))
 
-    # Reconstruct
-    goal = None; goal_cost = INF
+    # ---- Goal
+    goal = None
+    goal_cost = INF
     for qi in range(len(Q)-1, -1, -1):
         k = (v, qi)
         if k in best and best[k] < goal_cost:
@@ -502,33 +784,109 @@ def rcsp_optimize(start_lat, start_lon, end_lat, end_lon,
     if goal is None:
         raise RuntimeError("No feasible RCSP solution in bbox.")
 
-    path_nodes = []; charges = []
+    # ---- Reconstruct
+    path_nodes = []
+    charges = []
     k = goal
     while k in pred:
         prev, pqi, act, info = pred[k]
         if act == "charge":
             charges.append((k[0], Q[pqi], Q[k[1]], info))
-        path_nodes.append(k[0]); k = (prev, pqi)
-    path_nodes.append(u); path_nodes.reverse(); charges.reverse()
+        path_nodes.append(k[0])
+        k = (prev, pqi)
+    path_nodes.append(u)
+    path_nodes.reverse()
+    charges.reverse()
 
-    lats = [G.nodes[n]['y'] for n in path_nodes]; lons = [G.nodes[n]['x'] for n in path_nodes]
-    line = LineString([(lon,lat) for lon,lat in zip(lons,lats)])
+    lats = [G.nodes[n]['y'] for n in path_nodes]
+    lons = [G.nodes[n]['x'] for n in path_nodes]
+    line = LineString([(lon, lat) for lon, lat in zip(lons, lats)])
 
-    safe_lines, risk_lines = segment_route_by_risk(line, flood_union_m,
-                                                   buffer_m=(EXTREME_BUFFER_M if extreme else SIM_DEFAULTS["route_buffer_m"]))
+    # ---- Segment by risk
+    safe_lines, risk_lines = segment_route_by_risk(
+        line, flood_union_m, buffer_m=(EXTREME_BUFFER_M if extreme else ROUTE_BUFFER_M)
+    )
+
+    # ---- Map planned charges back to charger rows (optional)
     planned_stops = []
-    if isinstance(chargers_df, (pd.DataFrame, gpd.GeoDataFrame)) and not chargers_df.empty:
-        for (nid, q_before, q_after, info) in charges:
-            lat, lon = G.nodes[nid]['y'], G.nodes[nid]['x']
-            try:
-                idx = ((chargers_df["Latitude"]-lat)**2 + (chargers_df["Longitude"]-lon)**2).idxmin()
-                row = chargers_df.loc[idx]
+    if isinstance(chargers_df, (pd.DataFrame, gpd.GeoDataFrame)) and not chargers_df.empty and charges:
+        cols = {c.lower(): c for c in chargers_df.columns}
+        lat_col = cols.get("latitude")
+        lon_col = cols.get("longitude")
+        rowid_col = cols.get("row_id") or "ROW_ID"
+        if lat_col and lon_col and (rowid_col in chargers_df.columns):
+            lats_arr = pd.to_numeric(chargers_df[lat_col], errors="coerce").to_numpy()
+            lons_arr = pd.to_numeric(chargers_df[lon_col], errors="coerce").to_numpy()
+            for (nid, q_before, q_after, info) in charges:
+                try:
+                    lat = float(G.nodes[nid]["y"]); lon = float(G.nodes[nid]["x"])
+                except Exception:
+                    continue
+                d2 = (lats_arr - lat)**2 + (lons_arr - lon)**2
+                idx = int(np.nanargmin(d2)) if np.isfinite(d2).any() else None
+                if idx is None: continue
+                row = chargers_df.iloc[idx]
+                rid = int(row[rowid_col]) if pd.notna(row.get(rowid_col, None)) else int(idx)
                 planned_stops.append(dict(
-                    ROW_ID=int(row["ROW_ID"]), Operational=(row.get("AvailabilityLabel","")=="Operational")
+                    ROW_ID=rid,
+                    Operational=(str(row.get("AvailabilityLabel","")) == "Operational"),
+                    soc_before=q_before, soc_after=q_after,
+                    energy_kwh=float(battery_kwh) * (q_after - q_before),
+                    charge_time_min=float(info.get("dt", 0.0)) / 60.0
                 ))
-            except Exception:
-                pass
+
     return line, safe_lines, risk_lines, planned_stops, goal_cost
+
+
+# =========================
+# Planner used by the Dash UI
+# =========================
+def line_to_latlon_list(line: LineString) -> List[Tuple[float,float]]:
+    return [(lat, lon) for lon, lat in line.coords]
+
+def plan_rcsp_route(sl, so, el, eo, ev: EVParams, extreme=False):
+    """Wrapper that calls rcsp_optimize and converts its outputs to UI-friendly objects."""
+    if not HAS_OSMNX:
+        raise RuntimeError("OSMnx not available")
+
+    ctr_lat, ctr_lon = (sl+el)/2.0, (so+eo)/2.0
+    _G, chargers_df = fetch_graph_and_chargers(ctr_lat, ctr_lon, dist_m=20000)
+
+    # Use no flood union by default in this no-tiles build; pass a union here if you have it.
+    flood_union_m = None
+
+    line, safe_lines, risk_lines, planned_stops, goal_cost = rcsp_optimize(
+        sl, so, el, eo,
+        ev.battery_kWh, ev.start_soc*100, ev.reserve_soc*100, ev.target_soc*100,
+        ev.kWh_per_km, chargers_df, flood_union_m, extreme=extreme
+    )
+
+    coords = line_to_latlon_list(line)
+
+    stops: List[StopInfo] = []
+    for st in planned_stops:
+        try:
+            row = chargers_df.loc[chargers_df["ROW_ID"].eq(st["ROW_ID"])].iloc[0]
+            s = StopInfo(
+                lat=float(row["Latitude"]),
+                lon=float(row["Longitude"]),
+                name=str(row.get("Name","Charger")),
+                postcode=get_postcode(float(row["Latitude"]), float(row["Longitude"])),
+                ZoneLabel=row.get("ZoneLabel","Outside"),
+                ZoneColor=row.get("ZoneColor", ZONE_COLORS["Outside"]),
+                Operational=bool(st.get("Operational", True)),
+                soc_before=float(st.get("soc_before", 0.0)),
+                soc_after=float(st.get("soc_after", 0.0)),
+                energy_kWh=float(st.get("energy_kwh", 0.0)),
+                charge_time_min=float(st.get("charge_time_min", 0.0)),
+            )
+            stops.append(s)
+            time.sleep(1)  # be polite to Nominatim
+        except Exception:
+            continue
+
+    total_cost_min = float(goal_cost)/60.0
+    return coords, stops, total_cost_min
 
 # =========================
 # Folium helpers — tiles & overlays
@@ -596,6 +954,9 @@ def add_base_tiles(m):
 def _row_to_tooltip_html(row, title=None):
     s = f"<b>{title or 'Data Point'}</b><br>"
     for k, v in row.items():
+        # Drop columns where the value is NaN, None, or empty string
+        if pd.isna(v) or v is None or str(v).strip() == "":
+            continue
         s += f"<b>{k}:</b> {v}<br>"
     return s
 
@@ -809,7 +1170,13 @@ def _parse_metoffice_timeseries(raw):
 # =========================
 # Dash app + header logo + KML download
 # =========================
-app = dash.Dash(__name__)
+
+app = Dash(__name__)
+app.layout = html.Div([
+    html.H1("OK"),
+    dcc.Dropdown(id="x")
+])
+
 server = app.server
 
 # Serve logo from Google Drive (cached to disk)
@@ -848,139 +1215,313 @@ def preload_zones_json() -> str:
 
 # Build KML from route+stops
 def _kml_escape(s: str) -> str:
-    return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def _kml_argb_from_hex(rgb: str) -> str:
+    """
+    Convert #rrggbb to KML aabbggrr (opaque).
+    Falls back to green if input is malformed.
+    """
+    try:
+        if not (isinstance(rgb, str) and rgb.startswith("#") and len(rgb) == 7):
+            raise ValueError
+        rr, gg, bb = rgb[1:3], rgb[3:5], rgb[5:7]
+        return f"ff{bb}{gg}{rr}"
+    except Exception:
+        return "ff327d2e"  # fallback for "#2E7D32"
 
 def build_kml(route_data: dict) -> str:
     name = "EV Journey Simulator"
     linestring = ""
-    coords = route_data.get("route") or []
+    coords = (route_data or {}).get("route") or []
+
     if coords:
-        coord_str = " ".join([f"{p['lon']:.6f},{p['lat']:.6f},0" for p in coords])
+        coord_str = " ".join(f"{p['lon']:.6f},{p['lat']:.6f},0" for p in coords)
         linestring = f"""
-        <Placemark>
-          <name>Planned route</name>
-          <Style><LineStyle><color>ff8a2be2</color><width>4</width></LineStyle></Style>
-          <LineString><tessellate>1</tessellate><coordinates>{coord_str}</coordinates></LineString>
-        </Placemark>"""
+  <Placemark>
+    <name>Planned route</name>
+    <Style><LineStyle><color>ff8a2be2</color><width>4</width></LineStyle></Style>
+    <LineString><tessellate>1</tessellate><coordinates>{coord_str}</coordinates></LineString>
+  </Placemark>"""
+
     def mk_pt(title, lat, lon, color_hex=None):
-        k = color_hex or "#2E7D32"
-        # KML aabbggrr; hex input is #rrggbb
-        kml_color = "ff" + k[5:7] + k[3:5] + k[1:3]
+        kml_color = _kml_argb_from_hex(color_hex or "#2E7D32")
         return f"""
-        <Placemark>
-          <name>{_kml_escape(title)}</name>
-          <Style><IconStyle><color>{kml_color}</color></IconStyle></Style>
-          <Point><coordinates>{lon:.6f},{lat:.6f},0</coordinates></Point>
-        </Placemark>"""
+  <Placemark>
+    <name>{_kml_escape(title)}</name>
+    <Style><IconStyle><color>{kml_color}</color></IconStyle></Style>
+    <Point><coordinates>{lon:.6f},{lat:.6f},0</coordinates></Point>
+  </Placemark>"""
+
     pts = []
-    s = route_data.get("start"); e = route_data.get("end")
-    if s: pts.append(mk_pt("Start", s["lat"], s["lon"], "#2E7D32"))
-    if e: pts.append(mk_pt("End",   e["lat"], e["lon"], "#1f78b4"))
-    for i, st in enumerate(route_data.get("stops") or [], 1):
-            title = st.get("name") or f"Stop {i}"
-            color_hex = st.get("ZoneColor", "#2E7D32")
-            pts.append(mk_pt(title, st["lat"], st["lon"], color_hex))
+    s = (route_data or {}).get("start")
+    e = (route_data or {}).get("end")
+    if s:
+        pts.append(mk_pt("Start", float(s["lat"]), float(s["lon"]), "#2E7D32"))
+    if e:
+        pts.append(mk_pt("End", float(e["lat"]), float(e["lon"]), "#1f78b4"))
+
+    for i, st in enumerate((route_data or {}).get("stops") or [], 1):
+        title = st.get("name") or f"Stop {i}"
+        color_hex = st.get("ZoneColor") or "#2E7D32"
+        pts.append(mk_pt(title, float(st["lat"]), float(st["lon"]), color_hex))
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2">
 <Document>
-  <name>{_kml_escape(name)}</name>
-  {linestring}
+  <name>{_kml_escape(name)}</name>{linestring}
   {''.join(pts)}
 </Document>
 </kml>"""
+# Layout
+from dash import html, dcc
+# Layout
+from dash import html, dcc
 
-# ---------- Layout (iframe uses srcDoc now) ----------
 app.layout = html.Div([
+    # Header
     html.Div([
-        html.Img(src="/__logo", style={"height":"200px", "marginRight":"8px"}),
-        html.H1("AquaEV – Decision Support Dashboard",
-                style={"margin":"4px"})
-    ], style={"display":"flex","alignItems":"center","gap":"100px","marginBottom":"8px"}),
+        html.Img(
+            src="/__logo",
+            style={"height": "200px", "marginRight": "8px"}
+        ),
+        html.H1(
+            "CLEETS-SMART: Sustainable Mobility and Resilient Transport",
+            style={"margin": "4px"}
+        )
+    ], style={
+        "display": "flex",
+        "alignItems": "center",
+        "gap": "100px",
+        "marginBottom": "8px"
+    }),
 
-    html.H2("A) Chargers & Flood Overlays", style={"margin":"24px 7px 8px"}),
+    # Section A – Chargers & Flood Overlays
+    html.H2("A) Chargers & Flood Overlays", style={"margin": "24px 7px 8px"}),
     html.Div([
-        html.Div([html.Label("country(s)"),
-            dcc.Dropdown(id="f-country",
-                options=[{"label":t, "value":t} for t in country_OPTIONS],
-                value=[], multi=True, placeholder="All countrys")], style={"minWidth":"260px"}),
-        html.Div([html.Label("country contains"),
-            dcc.Input(id="f-country-like", type="text", placeholder="substring", debounce=True)], style={"minWidth":"220px"}),
-        html.Div([html.Label("Operational"),
-            dcc.Checklist(id="f-op",
-                options=[{"label":"Operational","value":"op"},
-                         {"label":"Not operational","value":"down"},
-                         {"label":"Unknown","value":"unk"}],
-                value=["op","down","unk"], inputStyle={"marginRight":"6px"})], style={"minWidth":"320px"}),
-        html.Div([html.Label("Show overlays"),
-            dcc.Checklist(id="layers",
-                options=[{"label":"FRAW","value":"fraw"},
-                         {"label":"FMfP","value":"fmfp"},
-                         {"label":"Live warnings","value":"live"},
-                         {"label":"Context","value":"ctx"}],
-                value=["fraw","fmfp"], inputStyle={"marginRight":"6px"})], style={"minWidth":"360px"}),
-        html.Div([html.Label("Start-up mode"),
-            dcc.Checklist(id="light", options=[{"label":"Light mode (fast start)","value":"on"}],
-                          value=["on"])], style={"minWidth":"260px"}),
-        html.Button("Compute/Update zones", id="btn-zones", n_clicks=0, style={"height":"38px","marginLeft":"8px"}),
-        html.Button("Refresh overlays", id="btn-refresh", n_clicks=0, style={"height":"38px","marginLeft":"8px"}),
-    ], style={"display":"flex","gap":"12px","alignItems":"end","flexWrap":"wrap","margin":"6px 0 12px"}),
+        html.Div([
+            html.Label("country(s)"),
+            dcc.Dropdown(
+                id="f-country",
+                options=[{"label": t, "value": t} for t in country_OPTIONS],
+                value=[], multi=True, placeholder="All countrys"
+            )
+        ], style={"minWidth": "260px"}),
 
+        html.Div([
+            html.Label("country contains"),
+            dcc.Input(id="f-country-like", type="text", placeholder="substring", debounce=True)
+        ], style={"minWidth": "220px"}),
+
+        html.Div([
+            html.Label("Operational"),
+            dcc.Checklist(
+                id="f-op",
+                options=[
+                    {"label": "Operational", "value": "op"},
+                    {"label": "Not operational", "value": "down"},
+                    {"label": "Unknown", "value": "unk"}
+                ],
+                value=["op", "down", "unk"],
+                inputStyle={"marginRight": "6px"}
+            )
+        ], style={"minWidth": "320px"}),
+
+        html.Div([
+            html.Label("Show overlays"),
+            dcc.Checklist(
+                id="layers",
+                options=[
+                    {"label": "FRAW", "value": "fraw"},
+                    {"label": "FMfP", "value": "fmfp"},
+                    {"label": "Live warnings", "value": "live"},
+                    {"label": "Context", "value": "ctx"}
+                ],
+                value=["fraw", "fmfp"],
+                inputStyle={"marginRight": "6px"}
+            )
+        ], style={"minWidth": "360px"}),
+
+        html.Div([
+            html.Label("Start-up mode"),
+            dcc.Checklist(
+                id="light",
+                options=[{"label": "Light mode (fast start)", "value": "on"}],
+                value=["on"]
+            )
+        ], style={"minWidth": "260px"}),
+
+        html.Button("Compute/Update zones", id="btn-zones", n_clicks=0,
+                    style={"height": "38px", "marginLeft": "8px"}),
+        html.Button("Refresh overlays", id="btn-refresh", n_clicks=0,
+                    style={"height": "38px", "marginLeft": "8px"}),
+    ], style={
+        "display": "flex",
+        "gap": "12px",
+        "alignItems": "end",
+        "flexWrap": "wrap",
+        "margin": "6px 0 12px"
+    }),
+
+    # Section B – Journey Simulator
     html.H2("B) Journey Simulator"),
     html.Div([
-        html.Div([html.Label("Start (lat, lon)"),
-            dcc.Input(id="start-lat", type="number", value=SIM_DEFAULTS["start_lat"], step=0.0001, style={"width":"120px"}),
-            dcc.Input(id="start-lon", type="number", value=SIM_DEFAULTS["start_lon"], step=0.0001, style={"width":"120px"})]),
-        html.Div([html.Label("End (lat, lon)"),
-            dcc.Input(id="end-lat", type="number", value=SIM_DEFAULTS["end_lat"], step=0.0001, style={"width":"120px"}),
-            dcc.Input(id="end-lon", type="number", value=SIM_DEFAULTS["end_lon"], step=0.0001, style={"width":"120px"})]),
-        html.Div([html.Label("Battery / SOC start,res,target"),
-            dcc.Input(id="batt-kwh", type="number", value=SIM_DEFAULTS["battery_kwh"], step=1, style={"width":"90px"}),
-            dcc.Input(id="soc-init", type="number", value=SIM_DEFAULTS["init_soc"], step=1, style={"width":"70px"}),
-            dcc.Input(id="soc-res",  type="number", value=SIM_DEFAULTS["reserve_soc"], step=1, style={"width":"70px"}),
-            dcc.Input(id="soc-tgt",  type="number", value=SIM_DEFAULTS["target_soc"], step=1, style={"width":"70px"})]),
-        html.Div([html.Label("kWh/km, max offset (km), min leg (km)"),
-            dcc.Input(id="cons-kwhkm", type="number", value=SIM_DEFAULTS["kwh_per_km"], step=0.01, style={"width":"90px"}),
-            dcc.Input(id="max-offset", type="number", value=SIM_DEFAULTS["max_charger_offset_km"], step=0.1, style={"width":"110px"}),
-            dcc.Input(id="min-leg",   type="number", value=SIM_DEFAULTS["min_leg_km"], step=1, style={"width":"100px"})]),
-        html.Div([html.Label("Exact optimiser (graph/DP)"),
-            dcc.Checklist(id="use-rcsp", options=[{"label":"Enable","value":"on"}], value=[])],
-            style={"minWidth":"180px"}),
-        html.Div([html.Label("Extreme weather"),
-            dcc.Checklist(id="extreme", options=[{"label":"On","value":"on"}], value=[])],
-            style={"minWidth":"150px"}),
-        html.Div([html.Label("Animate car / Speed (km/h)"),
-            dcc.Checklist(id="animate", options=[{"label":"Animate","value":"on"}], value=["on"]),
-            dcc.Input(id="speed-kmh", type="number", value=45, step=5, style={"width":"90px"})],
-            style={"minWidth":"260px"}),
-        html.Button("Simulate", id="btn-sim", n_clicks=0, style={"height":"38px","marginLeft":"8px"}),
-        html.Button("Download route for Google Maps (KML)", id="btn-kml", n_clicks=0, style={"height":"38px","marginLeft":"8px"}),
-    ], style={"display":"flex","gap":"12px","alignItems":"end","flexWrap":"wrap","marginBottom":"10px"}),
+        # Postcode inputs
+        html.Div([
+            html.Label("Start & End (postcode)"),
+            dcc.Input(
+                id="start_pc", type="text",
+                placeholder="e.g. CF10 3AT or 'Cardiff Castle'",
+                debounce=True, style={"width": "260px"}
+            ),
+            dcc.Input(
+                id="end_pc", type="text",
+                placeholder="e.g. SA1 3SN or 'Swansea Marina'",
+                debounce=True, style={"width": "260px"}
+            ),
+            html.Button(
+                "Use postcodes", id="btn-geocode", n_clicks=0,
+                style={"marginLeft": "8px"}
+            ),
+        ], style={
+            "display": "grid",
+            "gridTemplateColumns": "repeat(3, 260px) 140px",
+            "gap": "8px",
+            "marginBottom": "6px"
+        }),
 
-    # Iframe uses srcDoc; updated directly from callbacks
-    dcc.Loading(html.Iframe(
-        id="map",
-        srcDoc="<html><body style='font-family:sans-serif;padding:10px'>Loading…</body></html>",
-        style={'width':'100%','height':'620px','border':'1px solid #ddd','borderRadius':'8px'}
-    )),
-    html.Div(id="itinerary", style={"marginTop":"10px"}),
+        # Lat/lon row
+        html.Div([
+            html.Label("Start lat,lon"),
+            dcc.Input(id="sla", type="number", value=51.4816, step=0.0001),
+            dcc.Input(id="slo", type="number", value=-3.1791, step=0.0001),
+            html.Label("End lat,lon"),
+            dcc.Input(id="ela", type="number", value=51.6164, step=0.0001),
+            dcc.Input(id="elo", type="number", value=-3.9409, step=0.0001),
+        ], style={
+            "display": "grid",
+            "gridTemplateColumns": "repeat(4, 180px)",
+            "gap": "8px"
+        }),
 
+        # Vehicle selection
+        html.Div([
+            html.Label("Vehicle category", style={"whiteSpace": "nowrap"}),
+            dcc.Dropdown(
+                id="veh_cat",
+                options=[{"label": c, "value": c} for c in VEHICLE_PRESETS.keys()],
+                value="Hatchback", clearable=False,
+                style={"flex": "1", "minWidth": "220px"}
+            ),
+            html.Label("Vehicle model", style={"marginLeft": "16px", "whiteSpace": "nowrap"}),
+            dcc.Dropdown(
+                id="veh_model",
+                options=[{"label": m, "value": m}
+                         for m in VEHICLE_PRESETS["Hatchback"].keys()],
+                value="VW ID.3 Pro", clearable=False,
+                style={"flex": "1", "minWidth": "260px"}
+            ),
+        ], style={
+            "display": "flex",
+            "alignItems": "center",
+            "justifyContent": "space-between",
+            "gap": "12px",
+            "marginTop": "6px",
+            "flexWrap": "nowrap",
+            "width": "100%"
+        }),
+
+        # Battery parameters
+        html.Div([
+            html.Label("Battery kWh"), dcc.Input(id="batt", type="number", value=75.0, step=1),
+            html.Label("Start SoC (0..1)"), dcc.Input(id="si", type="number", value=0.8, step=0.05),
+            html.Label("Reserve SoC"), dcc.Input(id="sres", type="number", value=0.1, step=0.05),
+            html.Label("Target SoC"), dcc.Input(id="stgt", type="number", value=0.8, step=0.05),
+            html.Label("kWh/km"), dcc.Input(id="kwhkm", type="number", value=0.20, step=0.01),
+            html.Label("Max charge kW"), dcc.Input(id="pmax", type="number", value=120.0, step=5),
+        ], style={
+            "display": "grid",
+            "gridTemplateColumns": "repeat(6, 160px)",
+            "gap": "8px",
+            "marginTop": "8px"
+        }),
+
+        dcc.Checklist(
+            id="show_leg_details",
+            options=[{"label": "Show per-leg details", "value": "details"}],
+            value=["details"], inline=True
+        ),
+
+        dcc.RadioItems(
+            id="units",
+            options=[
+                {"label": "km / kWh / %", "value": "metric"},
+                {"label": "miles / kWh / %", "value": "imperial"}
+            ],
+            value="metric", inline=True
+        ),
+
+        html.Button("Optimise", id="simulate", n_clicks=0, style={"marginTop": "10px"}),
+        html.Button("Download KML", id="btn-kml", n_clicks=0, style={"marginLeft": "8px"}),
+
+        html.Div(id="status", style={"marginTop": "10px"}),
+        html.Div(id="explain", style={"marginTop": "10px", "whiteSpace": "pre-line"}),
+
+        dcc.Loading(
+            html.Iframe(
+                id="map",
+                srcDoc=(
+                    "<html><body style='font-family:sans-serif;padding:10px'>Loading…</body></html>"
+                ),
+                style={
+                    "width": "100%",
+                    "height": "620px",
+                    "border": "1px solid #ddd",
+                    "borderRadius": "8px"
+                }
+            )
+        ),
+
+        html.Div(id="itinerary", style={"marginTop": "10px"}),
+    ]),
+
+    # Section C – Weather
     html.H2("C) Weather for Wales"),
     html.Div([
-        html.Div([html.Label("Location"),
-                  dcc.Dropdown(id='wales-location', value='Cardiff',
-                               options=[{"label":k, "value":k} for k in WALES_LOCS.keys()],
-                               clearable=False, style={"width":"220px"})], style={"marginRight":"16px"}),
-        dcc.Interval(id='wx-refresh', interval=5*60*1000, n_intervals=0)
-    ], style={"display":"flex","alignItems":"center","gap":"12px"}),
-    html.Div(id='weather-split', style={"display":"grid","gridTemplateColumns":"1fr 1fr","gap":"12px","alignItems":"stretch"}),
+        html.Div([
+            html.Label("Location"),
+            dcc.Dropdown(
+                id="wales-location",
+                value="Cardiff",
+                options=[{"label": k, "value": k} for k in WALES_LOCS.keys()],
+                clearable=False,
+                style={"width": "220px"}
+            )
+        ], style={"marginRight": "16px"}),
 
+        dcc.Interval(id="wx-refresh", interval=5 * 60 * 1000, n_intervals=0)
+    ], style={
+        "display": "flex",
+        "alignItems": "center",
+        "gap": "12px"
+    }),
+
+    html.Div(
+        id="weather-split",
+        style={
+            "display": "grid",
+            "gridTemplateColumns": "1fr 1fr",
+            "gap": "12px",
+            "alignItems": "stretch"
+        }
+    ),
+
+    # Persistent storage + background refreshers
     dcc.Store(id="store-zones", data=preload_zones_json()),
     dcc.Store(id="overlay-refresh-token"),
     dcc.Store(id="store-route"),
     dcc.Download(id="dl-kml"),
-    # Fire once on load so the map renders immediately
-    dcc.Interval(id="init", interval=250, n_intervals=0, max_intervals=1),
+    dcc.Interval(id="init", interval=250, n_intervals=0, max_intervals=1)
 ])
 
 # -------------------------
@@ -1007,6 +1548,55 @@ def _compute_zones(_n):
     return zones.to_json(orient="records")
 
 @app.callback(
+    Output("sla","value"), Output("slo","value"),
+    Output("ela","value"), Output("elo","value"),
+    Input("btn-geocode","n_clicks"),
+    State("start_pc","value"), State("end_pc","value"),
+    prevent_initial_call=True
+)
+def _fill_latlon_from_postcodes(_n, start_pc, end_pc):
+    s, e = geocode_start_end(start_pc or "", end_pc or "")
+    # Keep existing values if a side fails to geocode
+    sla = dash.no_update; slo = dash.no_update
+    ela = dash.no_update; elo = dash.no_update
+    if s: sla, slo = float(s[0]), float(s[1])
+    if e: ela, elo = float(e[0]), float(e[1])
+    return sla, slo, ela, elo
+
+@app.callback(
+    Output("veh_model", "options"),
+    Output("veh_model", "value"),
+    Input("veh_cat", "value"),
+)
+def _update_vehicle_models(cat):
+    cat = cat or next(iter(VEHICLE_PRESETS))
+    models = list(VEHICLE_PRESETS.get(cat, {}).keys())
+    opts = [{"label": m, "value": m} for m in models]
+    # keep first model as default
+    val = models[0] if models else dash.no_update
+    return opts, val
+
+@app.callback(
+    Output("batt", "value"),
+    Output("kwhkm", "value"),
+    Output("pmax", "value"),
+    # Optionally nudge target SoC to 0.8 on selection:
+    # Output("stgt", "value"),
+    Input("veh_cat", "value"),
+    Input("veh_model", "value"),
+    prevent_initial_call=True
+)
+def _apply_vehicle_preset(cat, model):
+    try:
+        spec = VEHICLE_PRESETS.get(cat, {}).get(model, {})
+        batt  = float(spec.get("battery_kWh", dash.no_update))
+        kwhkm = float(spec.get("kWh_per_km", dash.no_update))
+        pmax  = float(spec.get("max_charge_kW", dash.no_update))
+        return batt, kwhkm, pmax  # , 0.8
+    except Exception:
+        return dash.no_update, dash.no_update, dash.no_update  # , dash.no_update
+
+@app.callback(
     Output("map", "srcDoc"),
     Output("itinerary", "children"),
     Output("store-route", "data"),
@@ -1015,27 +1605,25 @@ def _compute_zones(_n):
     Input("f-country-like", "value"),
     Input("f-op", "value"),
     Input("layers", "value"),
-    Input("light", "value"),              # <-- Light/Incremental toggle
+    Input("light", "value"),
     Input("store-zones", "data"),
     Input("overlay-refresh-token", "data"),
-    # Simulation trigger + params
-    Input("btn-sim", "n_clicks"),
-    State("start-lat","value"), State("start-lon","value"),
-    State("end-lat","value"),   State("end-lon","value"),
-    State("batt-kwh","value"),  State("soc-init","value"),
-    State("soc-res","value"),   State("soc-tgt","value"),
-    State("cons-kwhkm","value"),
-    State("max-offset","value"), State("min-leg","value"),
-    State("use-rcsp","value"),
-    State("extreme","value"),
-    State("animate","value"),
-    State("speed-kmh","value"),
+    # Simulation trigger + params — USE EXISTING IDS FROM LAYOUT
+    Input("simulate", "n_clicks"),
+    State("sla","value"), State("slo","value"),
+    State("ela","value"), State("elo","value"),
+    State("batt","value"),  State("si","value"),
+    State("sres","value"),  State("stgt","value"),
+    State("kwhkm","value"), State("pmax","value"),
+    State("show_leg_details","value"),
+    State("units","value"),
     # Trigger once on load
     Input("init","n_intervals"),
 )
 def _update_map(countrys, country_like, op_vals, layers_vals, light_vals, zones_json, _tok,
-                sim_clicks, sla, slo, ela, elo, batt, si, sres, stgt, kwhkm, maxoff, minleg,
-                use_rcsp, extreme_vals, animate_vals, speed_kmh, _init_n):
+                sim_clicks, sla, slo, ela, elo, batt, si, sres, stgt, kwhkm, pmax,
+                show_leg_details, units, _init_n):
+
 
     light = "on" in (light_vals or [])
 
@@ -1088,55 +1676,41 @@ def _update_map(countrys, country_like, op_vals, layers_vals, light_vals, zones_
     route_store = {}
 
     # Route mode
+    
     if sim_clicks:
         try:
-            extreme = "on" in (extreme_vals or [])
-            animate = "on" in (animate_vals or [])
-            speed = float(speed_kmh or 45)
-
-            # Risk union can be very heavy — skip in light mode
+            # Optional heavy risk union (skip in light mode)
             flood_union_m = None
             if not light:
                 bounds = (min(slo,elo), min(sla,ela), max(slo,elo), max(sla,ela))
                 flood_union_m = get_flood_union(bounds, include_live=True, include_fraw=True, include_fmfp=True,
                                                 pad_m=SIM_DEFAULTS["wfs_pad_m"])
 
-            if ("on" in (use_rcsp or [])) and HAS_OSMNX:
+            # ---- Preferred: RCSP over OSM graph (true OSM road line + flood-aware penalties) ----
+            if HAS_OSMNX:
                 line, safe_lines, risk_lines, stops, total_cost = rcsp_optimize(
                     float(sla), float(slo), float(ela), float(elo),
                     float(batt), float(si), float(sres), float(stgt),
-                    float(kwhkm), d if not d.empty else gdf_ev, flood_union_m,
-                    extreme=(extreme and not light)
+                    float(kwhkm), d if not d.empty else gdf_ev, flood_union_m, extreme=False
                 )
-                # enrich stops with coords + names for KML
-                
-                stop_features = []
-                for st in stops:
-                    row = gdf_ev.loc[gdf_ev["ROW_ID"].eq(st["ROW_ID"])].iloc[0]
-                    stop_features.append(dict(
-                    lat=float(row["Latitude"]), lon=float(row["Longitude"]),
-                    name=f"{row.get('Operator','')} ({row.get('country','')})",
-                    desc=f"Postcode: {row.get('Postcode','')}; Zone: {row.get('ZoneLabel','Outside')}",
-                    ZoneLabel=row.get('ZoneLabel', 'Outside'),
-                    ZoneColor=row.get('ZoneColor', ZONE_COLORS.get('Outside'))
-                    ))
-                
 
                 html_str = render_map_html_route(
                     full_line=line, route_safe=safe_lines, route_risk=risk_lines,
-                    start=(float(sla),float(slo)), end=(float(ela),float(elo)),
-                    chargers=stops,
-    all_chargers_df=None,  # <--- new argument
-                    animate=animate, speed_kmh=speed,
-                    show_live_backdrops=(extreme and not light)
+                    start=(float(sla), float(slo)), end=(float(ela), float(elo)),
+                    chargers=stops, all_chargers_df=None,
+                    animate=False, speed_kmh=45, show_live_backdrops=False
                 )
-                rows = [f"**Exact (graph/DP)** — generalised cost ≈ {total_cost/60:.1f} min "
-                        f"({'light mode' if light else ('extreme weather' if extreme else 'normal')})"]
+
+                rows = [f"**Routing & charging plan** — RCSP on OSM road network; generalised cost ≈ {total_cost/60:.1f} min"]
                 if stops:
                     rows.append("---")
                     for i, st in enumerate(stops, 1):
-                        row = gdf_ev.loc[gdf_ev["ROW_ID"].eq(st["ROW_ID"])].iloc[0]
-                        rows.append(f"**Stop {i}** — {row.get('Operator','')} ({row.get('country','')}) {row.get('Postcode','')} — Zone: {row.get('ZoneLabel','Outside')}")
+                        row = gdf_ev.loc[gdf_ev['ROW_ID'].eq(st['ROW_ID'])].iloc[0]
+                        rows.append(
+                            f"**Stop {i}** — {row.get('Operator','')} ({row.get('country','')}) {row.get('Postcode','')}"
+                            f" • Zone: {row.get('ZoneLabel','Outside')} • +{st['energy_kwh']:.1f} kWh"
+                            f" to {int(100*st['soc_after'])}% in ~{st['charge_time_min']:.0f} min"
+                        )
                 itinerary_children = dcc.Markdown("\n\n".join(rows))
 
                 coords_latlng = [{"lat":lat, "lon":lon} for lon,lat in list(line.coords)]
@@ -1144,59 +1718,79 @@ def _update_map(countrys, country_like, op_vals, layers_vals, light_vals, zones_
                     start={"lat":float(sla), "lon":float(slo)},
                     end={"lat":float(ela), "lon":float(elo)},
                     route=coords_latlng,
-                    stops=stop_features,
+                    stops=[{
+                        "lat": gdf_ev.loc[gdf_ev['ROW_ID'].eq(s['ROW_ID'])].iloc[0]['Latitude'],
+                        "lon": gdf_ev.loc[gdf_ev['ROW_ID'].eq(s['ROW_ID'])].iloc[0]['Longitude'],
+                        "name": gdf_ev.loc[gdf_ev['ROW_ID'].eq(s['ROW_ID'])].iloc[0].get('Operator',"Charger"),
+                        "ZoneColor": gdf_ev.loc[gdf_ev['ROW_ID'].eq(s['ROW_ID'])].iloc[0].get('ZoneColor', ZONE_COLORS["Outside"])
+                    } for s in stops],
                     created_ts=time.time()
                 )
                 return html_str, itinerary_children, route_store
 
-            # Fallback to OSRM / straight line
-            line, dist_m, dur_s, src = osrm_route(float(sla), float(slo), float(ela), float(elo))
-            safe_lines, risk_lines = segment_route_by_risk(line, flood_union_m,
-                                                           buffer_m=(EXTREME_BUFFER_M if (extreme and not light) else SIM_DEFAULTS["route_buffer_m"]))
+            # ---- Fallback: OSRM road polyline + greedy charge suggestions ----
+            line, dist_m, dur_s, step_text, src = osrm_route(float(sla), float(slo), float(ela), float(elo))
+
+            stops = osrm_greedy_charge_plan(
+                line,
+                battery_kwh=float(batt),
+                init_soc=float(si),
+                reserve_soc=float(sres),
+                target_soc=float(stgt),
+                kwh_per_km=float(kwhkm),
+                chargers_df=d if not d.empty else gdf_ev,
+                max_charger_offset_km=float(SIM_DEFAULTS["max_charger_offset_km"])
+            )
+
+            safe_lines, risk_lines = segment_route_by_risk(
+                line, flood_union_m, buffer_m=ROUTE_BUFFER_M
+            )
+
             html_str = render_map_html_route(
                 full_line=line, route_safe=safe_lines, route_risk=risk_lines,
-                start=(float(sla),float(slo)), end=(float(ela),float(elo)),
-                chargers=[], 
-                all_chargers_df=d,  # <--- new argument
-                animate=animate, speed_kmh=speed,
-                show_live_backdrops=(extreme and not light)        
+                start=(float(sla), float(slo)), end=(float(ela), float(elo)),
+                chargers=stops, all_chargers_df=d,  # show all chargers plus planned ones
+                animate=False, speed_kmh=45, show_live_backdrops=False
             )
-            itinerary_children = dcc.Markdown(
-                f"**Fallback route:** {src} • ≈ {dist_m/1000.0:.1f} km • ≈ {dur_s/3600.0:.2f} h "
-                f"({'light mode' if light else ('extreme weather' if extreme else 'normal')})"
-            )
+
+            msg = [f"**Routing & charging plan** — OSRM ({src}) • {dist_m/1000.0:.1f} km • {dur_s/3600.0:.2f} h"]
+            if step_text:
+                msg.append("---")
+                msg.extend([f"- {t}" for t in step_text[:12]])
+            if stops:
+                msg.append("---")
+                for i, st in enumerate(stops, 1):
+                    row = gdf_ev.loc[gdf_ev['ROW_ID'].eq(st['ROW_ID'])].iloc[0]
+                    msg.append(
+                        f"**Stop {i}** — {row.get('Operator','')} ({row.get('country','')}) {row.get('Postcode','')}"
+                        f" • +{st['energy_kwh']:.1f} kWh to {int(100*st['soc_after'])}% in ~{st['charge_time_min']:.0f} min"
+                    )
+            itinerary_children = dcc.Markdown("\n".join(msg))
+
             coords_latlng = [{"lat":lat, "lon":lon} for lon,lat in list(line.coords)]
             route_store = dict(
                 start={"lat":float(sla), "lon":float(slo)},
                 end={"lat":float(ela), "lon":float(elo)},
                 route=coords_latlng,
-                stops=[],
+                stops=[{
+                    "lat": gdf_ev.loc[gdf_ev['ROW_ID'].eq(s['ROW_ID'])].iloc[0]['Latitude'],
+                    "lon": gdf_ev.loc[gdf_ev['ROW_ID'].eq(s['ROW_ID'])].iloc[0]['Longitude'],
+                    "name": gdf_ev.loc[gdf_ev['ROW_ID'].eq(s['ROW_ID'])].iloc[0].get('Operator',"Charger"),
+                    "ZoneColor": gdf_ev.loc[gdf_ev['ROW_ID'].eq(s['ROW_ID'])].iloc[0].get('ZoneColor', ZONE_COLORS["Outside"])
+                } for s in stops],
                 created_ts=time.time()
             )
+
             return html_str, itinerary_children, route_store
 
         except Exception as e:
-            try:
-                line = LineString([(float(slo),float(sla)), (float(elo),float(ela))])
-            except Exception:
-                line = LineString([(-3.2,51.5), (-3.9,51.6)])
-            html_str = render_map_html_route(
-                full_line=line, route_safe=[line], route_risk=[],
-                start=(float(sla or 51.5), float(slo or -3.2)),
-                end=(float(ela or 51.6), float(elo or -3.9)),
-                chargers=[], 
-                all_chargers_df=d,  # <--- new argument
-                animate=False, speed_kmh=45, show_live_backdrops=False
-            )
-            itinerary_children = dcc.Markdown(f"**Simulation error:** {e}")
-            return html_str, itinerary_children, {}
+            itinerary_children = dcc.Markdown(f"**Routing error:** {e}")
+            return render_map_html_ev(d, show_fraw, show_fmfp, show_live, show_ctx, light=light), itinerary_children, {}
 
     # EV overview
     html_str = render_map_html_ev(d, show_fraw, show_fmfp, show_live, show_ctx, light=light)
     return html_str, itinerary_children, {}
-    # EV overview
-    html_str = render_map_html_ev(d, show_fraw, show_fmfp, show_live, show_ctx, light=light)
-    return html_str, itinerary_children, {}
+ 
 
 # Weather split
 @app.callback(
@@ -1279,6 +1873,71 @@ def _download_kml(_n, route_data):
     kml = build_kml(route_data)
     return dict(content=kml, filename="ev_journey.kml", type="application/vnd.google-earth.kml+xml")
 
+def simulate(n, sla, slo, ela, elo, batt, si, sres, stgt, kwhkm, pmax, show_leg_details, units):
+    if not HAS_OSMNX:
+        return go.Figure(), "OSMnx not available or not installed.", ""
+    try:
+        coords, stops, cost_min = plan_rcsp_route(
+            float(sla), float(slo), float(ela), float(elo),
+            EVParams(
+                battery_kWh=batt, start_soc=si, reserve_soc=sres,
+                target_soc=stgt, kWh_per_km=kwhkm, max_charge_kW=pmax
+            ),
+            extreme=False
+        )
+        if not coords or len(coords) < 2:
+            return go.Figure(), "No route could be computed. Check start/end.", ""
+        center = ((float(sla)+float(ela))/2, (float(slo)+float(elo))/2)
+        fig = make_fig_geo(coords, stops, center)
+        status = f"Exact RCSP route. Total generalised cost ≈ {cost_min:.1f} min; stops: {len(stops)}."
+        # Journey narrative (with per-leg SoC/energy)
+        use_miles = (units == "imperial")
+        dist_func = (lambda km: km*0.621371) if use_miles else (lambda km: km)
+        dist_unit = "mi" if use_miles else "km"
+        fmt_dist = lambda d: f"{dist_func(d):.1f} {dist_unit}"
+        fmt_kwh = lambda e: f"{e:.1f} kWh"
+        fmt_soc = lambda x: f"{int(100*x)}%"
+
+        journey = []
+        total_dist = 0.0
+        total_energy = 0.0
+        journey.append(f"**Start:** ({sla:.4f}, {slo:.4f}), SoC: {fmt_soc(si)}, Battery: {batt:.1f} kWh")
+        prev = (sla, slo)
+        prev_soc = si
+
+        # pair stops with the path: simple legs start->stop1->...->end
+        waypoints = [(s.lat, s.lon, s) for s in stops] + [(ela, elo, None)]
+        for i, (lt, ln, s) in enumerate(waypoints, 1):
+            leg_dist = haversine_km(prev[0], prev[1], lt, ln)
+            leg_energy = leg_dist * kwhkm
+            total_dist += leg_dist
+            total_energy += leg_energy
+            if show_leg_details and "details" in (show_leg_details or []):
+                journey.append(
+                    f"\n**Leg {i}**: {fmt_dist(leg_dist)} → ({lt:.4f},{ln:.4f})"
+                )
+            if s is not None:
+                pct_added = int(100 * (s.soc_after - s.soc_before))
+                journey.append(
+                    f"  - **Stop {i}: {s.name}** ({s.lat:.4f},{s.lon:.4f})"
+                    f"\n    Postcode: `{s.postcode}`"
+                    f"\n    Arrived {fmt_soc(s.soc_before)}; charged {fmt_kwh(s.energy_kWh)} "
+                    f"({pct_added}% of battery) in ~{s.charge_time_min:.0f} min; left {fmt_soc(s.soc_after)}."
+                )
+                prev = (s.lat, s.lon)
+                prev_soc = s.soc_after
+            else:
+                journey.append(f"\n**End:** ({ela:.4f}, {elo:.4f})")
+
+        journey.append(f"\n**Total distance:** {fmt_dist(total_dist)}")
+        journey.append(f"**Total drive energy:** {fmt_kwh(total_energy)}")
+        journey.append(f"**Total charging time:** {sum(s.charge_time_min for s in stops):.0f} min")
+        journey.append(f"**Number of charging stops:** {len(stops)}")
+
+        return fig, status, dcc.Markdown("\n\n".join(journey))
+    except Exception as e:
+        return go.Figure(), f"Route computation failed: {e}", ""
+    
 # -------------------------
 # Run
 # -------------------------
