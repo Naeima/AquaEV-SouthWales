@@ -621,7 +621,8 @@ def _graph_two_points(sl, so, el, eo, dist_m=15000):
 
 def rcsp_optimize(start_lat, start_lon, end_lat, end_lon,
                   battery_kwh, init_soc, reserve_soc, target_soc,
-                  kwh_per_km, chargers_df, flood_union_m, extreme=False):
+                  kwh_per_km, chargers_df, flood_union_m, extreme=False,
+                  risk_penalty_per_km=None, max_seconds=5.0):
     if not HAS_OSMNX:
         raise RuntimeError("OSMnx not installed")
 
@@ -697,7 +698,12 @@ def rcsp_optimize(start_lat, start_lon, end_lat, end_lon,
         for _, r in chargers_df.iterrows():
             try:
                 nid = nn(G, float(r["Longitude"]), float(r["Latitude"]))
-                chargers[nid] = dict(power_kW=DEFAULT_POWER_KW,
+                p_kw = r.get('power_kW', None)
+                try:
+                    p_kw = float(p_kw) if p_kw is not None and p_kw==p_kw else None
+                except Exception:
+                    p_kw = None
+                chargers[nid] = dict(power_kW=(p_kw if p_kw and p_kw>0 else DEFAULT_POWER_KW),
                                      operational=(str(r.get("AvailabilityLabel","")) == "Operational"))
             except Exception:
                 continue
@@ -718,6 +724,11 @@ def rcsp_optimize(start_lat, start_lon, end_lat, end_lon,
     best[start_key] = 0.0
     heapq.heappush(hq, (0.0, u, q_to_idx(init_q)))
 
+    # Pareto sets per node for dominance: list of (qi, cost)
+    pareto = {}
+
+    t0 = time.time()
+
     # Collapse multiedges to fastest representative
     adj_min = {}
     for (uu, vv, kk), (L, T, R) in edges_lookup.items():
@@ -728,13 +739,28 @@ def rcsp_optimize(start_lat, start_lon, end_lat, end_lon,
     for (uu, vv), (L, T, R) in adj_min.items():
         adj.setdefault(uu, []).append((vv, L, T, R))
 
-    risk_penalty = EXTREME_RISK_PENALTY_PER_KM if extreme else BASE_RISK_PENALTY_PER_KM
+    risk_penalty = (risk_penalty_per_km if (risk_penalty_per_km is not None) else (EXTREME_RISK_PENALTY_PER_KM if extreme else BASE_RISK_PENALTY_PER_KM))
 
     while hq:
+        # Timeout check
+        if (time.time() - t0) > max_seconds:
+            raise TimeoutError(f"RCSP exceeded time budget of {max_seconds:.1f}s")
         cost, node, qi = heapq.heappop(hq)
+        # Dominance: if an existing label at this node has >= SOC and <= cost, skip
+        pls = pareto.get(node, [])
+        dominated = False
+        for qj_existing, cj in pls:
+            if (qj_existing >= qi) and (cj <= cost + 1e-9):
+                dominated = True
+                break
+        if dominated:
+            continue
         if best.get((node, qi), INF) < cost - 1e-9:
             continue
         if node == v and Q[qi] >= reserve_q:
+            # update pareto set with this terminal label
+            ps = pareto.setdefault(node, [])
+            ps.append((qi, cost))
             break
 
         # Drive transitions
@@ -750,6 +776,13 @@ def rcsp_optimize(start_lat, start_lon, end_lat, end_lon,
                 best[key] = new_cost
                 pred[key] = (node, qi, "drive", dict(L=L, T=T, R=R))
                 heapq.heappush(hq, (new_cost, vv, qj))
+                ps = pareto.setdefault(vv, [])
+                ps[:] = [(qidx, cval) for (qidx, cval) in ps if not (qj >= qidx and new_cost <= cval + 1e-9)]
+                add_ok = True
+                for (qidx, cval) in ps:
+                    if (qidx >= qj) and (cval <= new_cost + 1e-9):
+                        add_ok = False; break
+                if add_ok: ps.append((qj, new_cost))
 
         # Charge transitions (only at charger nodes)
         ch = chargers.get(node)
@@ -768,7 +801,15 @@ def rcsp_optimize(start_lat, start_lon, end_lat, end_lon,
                     best[key] = new_cost
                     pred[key] = (node, qi, "charge",
                                  dict(p_kW=p_kw, added_kWh=added_kWh, dt=charge_time_s))
-                    heapq.heappush(hq, (new_cost, node, q_to_idx(q_next)))
+                    qn = q_to_idx(q_next)
+                    heapq.heappush(hq, (new_cost, node, qn))
+                    ps = pareto.setdefault(node, [])
+                    ps[:] = [(qidx, cval) for (qidx, cval) in ps if not (qn >= qidx and new_cost <= cval + 1e-9)]
+                    add_ok = True
+                    for (qidx, cval) in ps:
+                        if (qidx >= qn) and (cval <= new_cost + 1e-9):
+                            add_ok = False; break
+                    if add_ok: ps.append((qn, new_cost))
 
     # ---- Goal
     goal = None
@@ -840,22 +881,64 @@ def rcsp_optimize(start_lat, start_lon, end_lat, end_lon,
 def line_to_latlon_list(line: LineString) -> List[Tuple[float,float]]:
     return [(lat, lon) for lon, lat in line.coords]
 
-def plan_rcsp_route(sl, so, el, eo, ev: EVParams, extreme=False):
+def plan_rcsp_route(sl, so, el, eo, ev: EVParams, extreme=False, risk_penalty_per_km=None, rcsp_timeout_s=5.0):
     """Wrapper that calls rcsp_optimize and converts its outputs to UI-friendly objects."""
     if not HAS_OSMNX:
         raise RuntimeError("OSMnx not available")
 
     ctr_lat, ctr_lon = (sl+el)/2.0, (so+eo)/2.0
     _G, chargers_df = fetch_graph_and_chargers(ctr_lat, ctr_lon, dist_m=20000)
+    try:
+        # Prefer ONS/NCR set within a radius if available (uses global gdf_ev prepared earlier)
+        if 'gdf_ev' in globals():
+            import geopandas as gpd
+            from shapely.geometry import Point
+            center_pt = gpd.GeoSeries([Point(ctr_lon, ctr_lat)], crs="EPSG:4326")
+            radius_m = 20000
+            ev_local = gdf_ev.to_crs('EPSG:27700')
+            mask = ev_local.geometry.distance(center_pt.to_crs('EPSG:27700').iloc[0]) <= radius_m
+            subset = gdf_ev.loc[mask.values]
+            if not subset.empty:
+                out = subset.copy()
+                out['Latitude'] = out.geometry.y
+                out['Longitude'] = out.geometry.x
+                # Normalize power column names to 'power_kW' if present
+                for cand in ['power_kw','Power_kW','rated_power_kw','RatedPowerKW','connector_power_kw']:
+                    if cand in out.columns:
+                        out = out.rename(columns={cand:'power_kW'})
+                        break
+                # Minimal schema for RCSP
+                keep = ['Latitude','Longitude','Name','ROW_ID','AvailabilityLabel','power_kW']
+                for col in keep:
+                    if col not in out.columns:
+                        out[col] = None
+                chargers_df = out[keep].reset_index(drop=True)
+    except Exception:
+        pass
 
-    # Use no flood union by default in this no-tiles build; pass a union here if you have it.
-    flood_union_m = None
+    # Build flood union (metric CRS) from WFS layers over the OD bounding box
+    try:
+        bounds = (min(sl, el), min(so, eo), max(sl, el), max(so, eo))  # (south, west, north, east)
+        flood_union_m = get_flood_union(bounds, include_live=True, include_fraw=True, include_fmfp=True, pad_m=SIM_DEFAULTS["wfs_pad_m"])
+    except Exception:
+        flood_union_m = None
 
-    line, safe_lines, risk_lines, planned_stops, goal_cost = rcsp_optimize(
-        sl, so, el, eo,
-        ev.battery_kWh, ev.start_soc*100, ev.reserve_soc*100, ev.target_soc*100,
-        ev.kWh_per_km, chargers_df, flood_union_m, extreme=extreme
-    )
+    try:
+        line, safe_lines, risk_lines, planned_stops, goal_cost = rcsp_optimize(
+            sl, so, el, eo,
+            ev.battery_kWh, ev.start_soc*100, ev.reserve_soc*100, ev.target_soc*100,
+            ev.kWh_per_km, chargers_df, flood_union_m, extreme=extreme,
+            risk_penalty_per_km=risk_penalty_per_km, max_seconds=rcsp_timeout_s
+        )
+        used_src = "RCSP"
+        dist_m = float(line.length)*111000.0 if hasattr(line, "length") else None
+        dur_s = goal_cost
+        step_text = []
+    except Exception as e:
+        line, dist_m, dur_s, step_text, used_src = osrm_route(float(sl), float(so), float(el), float(eo))
+        safe_lines, risk_lines = segment_route_by_risk(line, flood_union_m, buffer_m=ROUTE_BUFFER_M)
+        planned_stops = []
+        goal_cost = dur_s
 
     coords = line_to_latlon_list(line)
 
@@ -1938,4 +2021,58 @@ def simulate(n, sla, slo, ela, elo, batt, si, sres, stgt, kwhkm, pmax, show_leg_
 # Run
 # -------------------------
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run_server(debug=True)
+
+# =========================
+# Calibration / Sensitivity
+# =========================
+def calibrate_risk_penalty(od_pairs, battery_kwh, init_soc, reserve_soc, target_soc, kwh_per_km,
+                           chargers_df, flood_union_m, lambda_grid=(0.0,30.0,60.0,120.0,240.0),
+                           exposure_weight=1.0, time_weight=1.0, max_seconds=3.0):
+    """
+    Grid-search calibration for risk penalty λ (seconds/km).
+    Scores each λ by a weighted sum of (route_time, risk_exposed_km).
+    Returns the λ with minimum average score across OD pairs.
+    """
+    best_lambda, best_score = None, float("inf")
+    for lam in lambda_grid:
+        tot_score = 0.0; n=0
+        for (sl,so,el,eo) in od_pairs:
+            try:
+                line, safe, risk, stops, cost = rcsp_optimize(
+                    sl, so, el, eo, battery_kwh, init_soc, reserve_soc, target_soc,
+                    kwh_per_km, chargers_df, flood_union_m, extreme=False,
+                    risk_penalty_per_km=lam, max_seconds=max_seconds
+                )
+                risk_km = sum(seg.length for seg in risk) * 111.0 if risk else 0.0
+                score = time_weight*float(cost)/3600.0 + exposure_weight*risk_km
+                tot_score += score; n += 1
+            except Exception:
+                continue
+        if n>0 and tot_score/n < best_score:
+            best_score, best_lambda = tot_score/n, lam
+    return best_lambda, best_score
+
+def sensitivity_on_params(od_pairs, ev_params, chargers_df, flood_union_m, lambdas=(0.0,60.0,240.0),
+                          reserves=(0.1,0.2), kwhs=(0.15,0.18,0.22)):
+    """Run a coarse sensitivity sweep over key parameters. Returns a list of results rows."""
+    rows=[]
+    for lam in lambdas:
+        for rs in reserves:
+            for k in kwhs:
+                succ=0; avg_time=0.0; avg_risk=0.0; cnt=0
+                for (sl,so,el,eo) in od_pairs:
+                    try:
+                        line, safe, risk, stops, cost = rcsp_optimize(
+                            sl, so, el, eo,
+                            ev_params.battery_kWh, ev_params.start_soc*100, rs*100, ev_params.target_soc*100,
+                            k, chargers_df, flood_union_m, extreme=False, risk_penalty_per_km=lam, max_seconds=3.0
+                        )
+                        risk_km = sum(seg.length for seg in risk) * 111.0 if risk else 0.0
+                        succ+=1; avg_time+=cost; avg_risk+=risk_km; cnt+=1
+                    except Exception:
+                        pass
+                if cnt>0:
+                    rows.append(dict(lambda_sec_per_km=lam, reserve=rs, kwh_per_km=k,
+                                     success=succ, avg_time_s=avg_time/max(1,cnt), avg_risk_km=avg_risk/max(1,cnt)))
+    return rows
