@@ -95,7 +95,7 @@ Contains Natural Resources Wales information © Natural Resources Wales and data
 
 ## Installation  
 ```bash
-git clone https://github.com/Naeima/AquaEV.git
-cd AquaEV
+git clone https://github.com/Naeima/CLEETS-SMART.git
+cd CLEETS-SMART
 pip install dash pandas geopandas folium shapely requests plotly osmnx
 python app.py
