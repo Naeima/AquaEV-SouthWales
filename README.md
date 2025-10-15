@@ -31,7 +31,7 @@ Contains Natural Resources Wales information © Natural Resources Wales and data
 ## Screenshots  
 
 ### Dashboard with flood overlays, journey simulator and weather forecast  
-![CLEETS-SMART Dashboard](DASH.png)  
+![CLEETS-SMART Dashboard](dash11.png)  
 
 ---
 
