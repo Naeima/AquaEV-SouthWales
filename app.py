@@ -25,6 +25,15 @@ import folium
 from folium.plugins import MarkerCluster, Draw, BeautifyIcon
 from folium.raster_layers import WmsTileLayer
 
+# 3D map (optional)
+MAPBOX_API_KEY = os.environ.get("pk.eyJ1IjoibmFlaW1hIiwiYSI6ImNsNDRoa295ZDAzMmkza21tdnJrNWRqNmwifQ.-cUTmhr1Q03qUXJfQoIKGQ", "").strip()
+try:
+    import pydeck as pdk
+    HAS_PYDECK = True
+except Exception:
+    HAS_PYDECK = False
+
+
 # Optional graph libs for exact optimiser
 try:
     import osmnx as ox
@@ -50,7 +59,6 @@ def geocode_postcode_uk(pc: str):
     except Exception:
         pass
     return None
-
 
 def geocode_text_osm(q: str):
     """General forward geocoder (Nominatim). Returns (lat, lon) or None."""
@@ -187,8 +195,6 @@ VEHICLE_PRESETS = {
         "Renault Kangoo E-Tech":{"battery_kWh": 45.0, "kWh_per_km": 0.20, "max_charge_kW": 80.0},
     },
 }
-
-
 # =========================
 # Utilities
 # =========================
@@ -387,6 +393,14 @@ def compute_model_zones_for_points(ev_gdf: gpd.GeoDataFrame) -> pd.DataFrame:
     out.loc[out["ROW_ID"].isin(lut.index), "ZoneColor"] = lut["zone"].map(ZONE_COLORS).fillna("#2E7D32")
     return out[["ROW_ID","ZoneLabel","ZoneColor"]]
 
+def safe_compute_zones():
+    try:
+        return compute_model_zones_for_points(gdf_ev)
+    except Exception as e:
+        # log e
+        return pd.DataFrame({"ROW_ID": gdf_ev["ROW_ID"],
+                             "ZoneLabel": "Outside",
+                             "ZoneColor": ZONE_COLORS["Outside"]})
 # =========================
 # Load EV data
 # =========================
@@ -474,21 +488,6 @@ def osrm_route(sl, so, el, eo):
             continue
     raise RuntimeError("OSRM routing failed on both endpoints")
 
-# def osrm_route(sl, so, el, eo):
-#     url = f"https://router.project-osrm.org/route/v1/driving/{so},{sl};{eo},{el}"
-#     params = {"overview":"full","geometries":"geojson","alternatives":"false","steps":"false"}
-#     try:
-#         r = requests.get(url, params=params, timeout=15).json()
-#         if r.get("routes"):
-#             coords = r["routes"][0]["geometry"]["coordinates"]
-#             ln = LineString([(c[0],c[1]) for c in coords])
-#             return ln, float(r["routes"][0]["distance"]), float(r["routes"][0]["duration"]), "OSRM"
-#     except Exception:
-#         pass
-#     ln = LineString([(so,sl),(eo,el)])
-#     d_km = haversine_km(sl, so, el, eo)
-#     return ln, d_km*1000.0, d_km/70.0*3600.0, "Great-circle (approx)"
-
 def get_flood_union(bounds, include_live=True, include_fraw=True, include_fmfp=True, pad_m=SIM_DEFAULTS["wfs_pad_m"]):
     bbox = bbox_expand(bounds, pad_m); chunks=[]
     if include_fmfp:
@@ -511,19 +510,6 @@ def get_flood_union(bounds, include_live=True, include_fraw=True, include_fmfp=T
     except Exception: pass
     try: return G.to_crs('EPSG:27700').union_all()
     except Exception: return G.to_crs('EPSG:27700').unary_union
-
-# def segment_route_by_risk(line_wgs84, risk_union_metric, buffer_m=30):
-#     if risk_union_metric is None: return [line_wgs84], []
-#     try: line_m = gpd.GeoSeries([line_wgs84], crs='EPSG:4326').to_crs('EPSG:27700').iloc[0]
-#     except Exception: line_m = gpd.GeoSeries([line_wgs84], crs='EPSG:4326').to_crs('EPSG:3857').iloc[0]
-#     hit = risk_union_metric.buffer(buffer_m)
-#     try: pieces = list(shp_split(line_m, hit.boundary))
-#     except Exception: pieces = [line_m]
-#     safe_m, risk_m = [], []
-#     for seg in pieces: (risk_m if seg.intersects(hit) else safe_m).append(seg)
-#     safe = gpd.GeoSeries(safe_m, crs='EPSG:27700').to_crs('EPSG:4326').tolist() if safe_m else []
-#     risk = gpd.GeoSeries(risk_m, crs='EPSG:27700').to_crs('EPSG:4326').tolist() if risk_m else []
-#     return safe, risk
 
 def segment_route_by_risk(line_wgs84, risk_union_metric, buffer_m=ROUTE_BUFFER_M):
     """Split route into safe vs risk segments against a metric-union geometry."""
@@ -573,10 +559,7 @@ def fetch_graph_and_chargers(center_lat, center_lon, dist_m=15000):
         chargers_df = pd.DataFrame(columns=["ROW_ID","Latitude","Longitude","Name","AvailabilityLabel"])
     return G, chargers_df
 
-
 # RCSP optimiser
-
-
 def _build_graph_bbox(north, south, east, west):
     """
     Return a drive network graph for the given bbox, compatible with OSMnx
@@ -810,7 +793,6 @@ def rcsp_optimize(start_lat, start_lon, end_lat, end_lon,
                         if (qidx >= qn) and (cval <= new_cost + 1e-9):
                             add_ok = False; break
                     if add_ok: ps.append((qn, new_cost))
-
     # ---- Goal
     goal = None
     goal_cost = INF
@@ -873,7 +855,6 @@ def rcsp_optimize(start_lat, start_lon, end_lat, end_lon,
                 ))
 
     return line, safe_lines, risk_lines, planned_stops, goal_cost
-
 
 # =========================
 # Planner used by the Dash UI
@@ -1191,61 +1172,6 @@ def render_map_html_route(full_line, route_safe, route_risk, start, end, charger
     m.get_root().html.add_child(folium.Element(legend_html))
     return m.get_root().render()
 
-
-# =========================
-# Weather (Open-Meteo default; Met Office optional)
-# =========================
-from functools import lru_cache
-
-@lru_cache(maxsize=128)
-def cached_get(url, headers_tuple=(), params_tuple=()):
-    headers = dict(headers_tuple) if headers_tuple else {}
-    params = dict(params_tuple) if params_tuple else {}
-    r = requests.get(url, headers=headers, params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-def _ts():
-    return str(int(time.time()//300))
-
-METOFFICE_KEY = os.environ.get("METOFFICE_KEY", "").strip()
-METOFFICE_SITE_API = os.environ.get("METOFFICE_SITE_API", "").strip()  # optional
-
-def get_weather(lat=51.48, lon=-3.18):
-    try:
-        if METOFFICE_KEY and METOFFICE_SITE_API:
-            headers = (("apikey", METOFFICE_KEY),)
-            params = (("latitude", str(lat)), ("longitude", str(lon)),)
-            data = cached_get(METOFFICE_SITE_API, headers, params)
-            return {"provider":"Met Office", "raw": data}
-        else:
-            url = "https://api.open-meteo.com/v1/forecast"
-            params = (
-                ("latitude", str(lat)), ("longitude", str(lon)),
-                ("current", "temperature_2m,precipitation,wind_speed_10m"),
-                ("hourly", "temperature_2m,precipitation_probability,wind_speed_10m"),
-                ("timezone", "Europe/London"),
-                ("_ts", _ts()),
-            )
-            data = cached_get(url, (), params)
-            return {"provider":"Open-Meteo", "raw": data}
-    except Exception as e:
-        return {"provider":"error", "error": str(e)}
-
-def _parse_metoffice_timeseries(raw):
-    try:
-        feats = raw.get("features") or []
-        if feats and isinstance(feats, list):
-            ts = feats[0].get("properties", {}).get("timeSeries") or []
-            times = [r.get("time") for r in ts if "time" in r][:24]
-            temps = [r.get("screenTemperature") for r in ts][:24]
-            pops  = [r.get("precipitationProbability") or r.get("precipProb") for r in ts][:24]
-            if times and temps:
-                return {"time": times, "temp": temps, "pop": pops or [None]*len(times)}
-    except Exception:
-        pass
-    return {}
-
 # =========================
 # Dash app + header logo + KML download
 # =========================
@@ -1354,26 +1280,13 @@ def build_kml(route_data: dict) -> str:
 </kml>"""
 # Layout
 from dash import html, dcc
-# Layout
-from dash import html, dcc
 
 app.layout = html.Div([
     # Header
     html.Div([
-        html.Img(
-            src="/__logo",
-            style={"height": "200px", "marginRight": "8px"}
-        ),
-        html.H1(
-            "CLEETS-SMART: Sustainable Mobility and Resilient Transport",
-            style={"margin": "4px"}
-        )
-    ], style={
-        "display": "flex",
-        "alignItems": "center",
-        "gap": "100px",
-        "marginBottom": "8px"
-    }),
+        html.Img(src="/__logo", style={"height": "200px", "marginRight": "8px"}),
+        html.H1("CLEETS-SMART: Sustainable Mobility and Resilient Transport", style={"margin": "4px"})
+    ], style={"display": "flex","alignItems": "center","gap": "100px","marginBottom": "8px"}),
 
     # Section A – Chargers & Flood Overlays
     html.H2("A) Chargers & Flood Overlays", style={"margin": "24px 7px 8px"}),
@@ -1434,138 +1347,10 @@ app.layout = html.Div([
                     style={"height": "38px", "marginLeft": "8px"}),
         html.Button("Refresh overlays", id="btn-refresh", n_clicks=0,
                     style={"height": "38px", "marginLeft": "8px"}),
-    ], style={
-        "display": "flex",
-        "gap": "12px",
-        "alignItems": "end",
-        "flexWrap": "wrap",
-        "margin": "6px 0 12px"
-    }),
+    ], style={"display": "flex","gap": "12px","alignItems": "end","flexWrap": "wrap","margin": "6px 0 12px"}),
 
-    # Section B – Journey Simulator
-    html.H2("B) Journey Simulator"),
-    html.Div([
-        # Postcode inputs
-        html.Div([
-            html.Label("Start & End (postcode)"),
-            dcc.Input(
-                id="start_pc", type="text",
-                placeholder="e.g. CF10 3AT or 'Cardiff Castle'",
-                debounce=True, style={"width": "260px"}
-            ),
-            dcc.Input(
-                id="end_pc", type="text",
-                placeholder="e.g. SA1 3SN or 'Swansea Marina'",
-                debounce=True, style={"width": "260px"}
-            ),
-            html.Button(
-                "Use postcodes", id="btn-geocode", n_clicks=0,
-                style={"marginLeft": "8px"}
-            ),
-        ], style={
-            "display": "grid",
-            "gridTemplateColumns": "repeat(3, 260px) 140px",
-            "gap": "8px",
-            "marginBottom": "6px"
-        }),
-
-        # Lat/lon row
-        html.Div([
-            html.Label("Start lat,lon"),
-            dcc.Input(id="sla", type="number", value=51.4816, step=0.0001),
-            dcc.Input(id="slo", type="number", value=-3.1791, step=0.0001),
-            html.Label("End lat,lon"),
-            dcc.Input(id="ela", type="number", value=51.6164, step=0.0001),
-            dcc.Input(id="elo", type="number", value=-3.9409, step=0.0001),
-        ], style={
-            "display": "grid",
-            "gridTemplateColumns": "repeat(4, 180px)",
-            "gap": "8px"
-        }),
-
-        # Vehicle selection
-        html.Div([
-            html.Label("Vehicle category", style={"whiteSpace": "nowrap"}),
-            dcc.Dropdown(
-                id="veh_cat",
-                options=[{"label": c, "value": c} for c in VEHICLE_PRESETS.keys()],
-                value="Hatchback", clearable=False,
-                style={"flex": "1", "minWidth": "220px"}
-            ),
-            html.Label("Vehicle model", style={"marginLeft": "16px", "whiteSpace": "nowrap"}),
-            dcc.Dropdown(
-                id="veh_model",
-                options=[{"label": m, "value": m}
-                         for m in VEHICLE_PRESETS["Hatchback"].keys()],
-                value="VW ID.3 Pro", clearable=False,
-                style={"flex": "1", "minWidth": "260px"}
-            ),
-        ], style={
-            "display": "flex",
-            "alignItems": "center",
-            "justifyContent": "space-between",
-            "gap": "12px",
-            "marginTop": "6px",
-            "flexWrap": "nowrap",
-            "width": "100%"
-        }),
-
-        # Battery parameters
-        html.Div([
-            html.Label("Battery kWh"), dcc.Input(id="batt", type="number", value=75.0, step=1),
-            html.Label("Start SoC (0..1)"), dcc.Input(id="si", type="number", value=0.8, step=0.05),
-            html.Label("Reserve SoC"), dcc.Input(id="sres", type="number", value=0.1, step=0.05),
-            html.Label("Target SoC"), dcc.Input(id="stgt", type="number", value=0.8, step=0.05),
-            html.Label("kWh/km"), dcc.Input(id="kwhkm", type="number", value=0.20, step=0.01),
-            html.Label("Max charge kW"), dcc.Input(id="pmax", type="number", value=120.0, step=5),
-        ], style={
-            "display": "grid",
-            "gridTemplateColumns": "repeat(6, 160px)",
-            "gap": "8px",
-            "marginTop": "8px"
-        }),
-
-        dcc.Checklist(
-            id="show_leg_details",
-            options=[{"label": "Show per-leg details", "value": "details"}],
-            value=["details"], inline=True
-        ),
-
-        dcc.RadioItems(
-            id="units",
-            options=[
-                {"label": "km / kWh / %", "value": "metric"},
-                {"label": "miles / kWh / %", "value": "imperial"}
-            ],
-            value="metric", inline=True
-        ),
-
-        html.Button("Optimise", id="simulate", n_clicks=0, style={"marginTop": "10px"}),
-        html.Button("Download KML", id="btn-kml", n_clicks=0, style={"marginLeft": "8px"}),
-
-        html.Div(id="status", style={"marginTop": "10px"}),
-        html.Div(id="explain", style={"marginTop": "10px", "whiteSpace": "pre-line"}),
-
-        dcc.Loading(
-            html.Iframe(
-                id="map",
-                srcDoc=(
-                    "<html><body style='font-family:sans-serif;padding:10px'>Loading…</body></html>"
-                ),
-                style={
-                    "width": "100%",
-                    "height": "620px",
-                    "border": "1px solid #ddd",
-                    "borderRadius": "8px"
-                }
-            )
-        ),
-
-        html.Div(id="itinerary", style={"marginTop": "10px"}),
-    ]),
-
-    # Section C – Weather
-    html.H2("C) Weather for Wales"),
+    # Section B – Weather
+    html.H2("B) Weather for Wales"),
     html.Div([
         html.Div([
             html.Label("Location"),
@@ -1579,28 +1364,162 @@ app.layout = html.Div([
         ], style={"marginRight": "16px"}),
 
         dcc.Interval(id="wx-refresh", interval=5 * 60 * 1000, n_intervals=0)
-    ], style={
-        "display": "flex",
-        "alignItems": "center",
-        "gap": "12px"
-    }),
+    ], style={"display": "flex","alignItems": "center","gap": "12px"}),
 
     html.Div(
         id="weather-split",
-        style={
-            "display": "grid",
-            "gridTemplateColumns": "1fr 1fr",
-            "gap": "12px",
-            "alignItems": "stretch"
-        }
+        style={"display": "grid","gridTemplateColumns": "1fr 1fr","gap": "12px","alignItems": "stretch"}
     ),
 
+    # Section C – Journey Simulator
+    html.H2("C) Journey Simulator"),
+    html.Div([
+        # Postcode inputs
+        html.Div([
+            html.Label("Start & End (postcode)"),
+            dcc.Input(id="start_pc", type="text",
+                      placeholder="e.g. CF10 3AT or 'Cardiff Castle'",
+                      debounce=True, style={"width": "260px"}),
+            dcc.Input(id="end_pc", type="text",
+                      placeholder="e.g. SA1 3SN or 'Swansea Marina'",
+                      debounce=True, style={"width": "260px"}),
+            html.Button("Use postcodes", id="btn-geocode", n_clicks=0, style={"marginLeft": "8px"}),
+        ], style={"display": "grid","gridTemplateColumns": "repeat(3, 260px) 140px","gap": "8px","marginBottom": "6px"}),
+
+        # Lat/lon row
+        html.Div([
+            html.Label("Start lat,lon"),
+            dcc.Input(id="sla", type="number", value=51.4816, step=0.0001),
+            dcc.Input(id="slo", type="number", value=-3.1791, step=0.0001),
+            html.Label("End lat,lon"),
+            dcc.Input(id="ela", type="number", value=51.6164, step=0.0001),
+            dcc.Input(id="elo", type="number", value=-3.9409, step=0.0001),
+        ], style={"display": "grid","gridTemplateColumns": "repeat(4, 180px)","gap": "8px"}),
+
+        # ---------- Vehicle selection (moved inside Section C) ----------
+        html.Div([
+            html.Label("Vehicle category", style={"whiteSpace": "nowrap"}),
+            dcc.Dropdown(
+                id="veh_cat",
+                options=[{"label": c, "value": c} for c in VEHICLE_PRESETS.keys()],
+                value="Hatchback",
+                clearable=False,
+                style={"flex": "1", "minWidth": "220px"},
+                persistence=True, persistence_type="memory",
+            ),
+            html.Label("Vehicle model", style={"marginLeft": "16px", "whiteSpace": "nowrap"}),
+            dcc.Dropdown(
+                id="veh_model",
+                options=[{"label": m, "value": m} for m in VEHICLE_PRESETS["Hatchback"].keys()],
+                value="VW ID.3 Pro",
+                clearable=False,
+                style={"flex": "1", "minWidth": "260px"},
+                persistence=True, persistence_type="memory",
+            ),
+        ], style={"display": "flex","alignItems": "center","justifyContent": "space-between","gap": "12px","marginTop": "6px","flexWrap": "wrap","width": "100%"}),
+
+        # Battery & charging parameters
+        html.Div([
+            html.Div([
+                html.Label("Battery capacity (kWh)"),
+                dcc.Input(id="batt", type="number", value=75.0, step=1, min=10, max=200, style={"width": "100%"}),
+                html.Small("Typical EVs: 40–100 kWh", style={"color": "#666"}),
+            ], style={"minWidth": "160px"}),
+
+            html.Div([
+                html.Label("Start SoC"),
+                dcc.Slider(id="si", min=0, max=1, step=0.05, value=0.80,
+                           tooltip={"always_visible": False, "placement": "bottom"}),
+                html.Div(id="si-label", style={"textAlign": "right", "fontSize": "12px", "color": "#666"},
+                         children="80%")
+            ], style={"minWidth": "220px"}),
+
+            html.Div([
+                html.Label("Reserve SoC"),
+                dcc.Slider(id="sres", min=0, max=0.5, step=0.05, value=0.10,
+                           tooltip={"always_visible": False, "placement": "bottom"}),
+                html.Div(id="sres-label", style={"textAlign": "right", "fontSize": "12px", "color": "#666"},
+                         children="10%")
+            ], style={"minWidth": "220px"}),
+
+            html.Div([
+                html.Label("Target SoC"),
+                dcc.Slider(id="stgt", min=0.5, max=1.0, step=0.05, value=0.80,
+                           tooltip={"always_visible": False, "placement": "bottom"}),
+                html.Div(id="stgt-label", style={"textAlign": "right", "fontSize": "12px", "color": "#666"},
+                         children="80%")
+            ], style={"minWidth": "220px"}),
+
+            html.Div([
+                html.Label("Consumption (kWh/km)"),
+                dcc.Slider(id="kwhkm", min=0.10, max=0.30, step=0.005, value=0.20,
+                           tooltip={"always_visible": False, "placement": "bottom"}),
+                html.Div(id="kwhkm-label", style={"textAlign": "right", "fontSize": "12px", "color": "#666"},
+                         children="0.20 kWh/km · ≈ 5.0 km/kWh")
+            ], style={"minWidth": "260px"}),
+
+            html.Div([
+                html.Label("Max charge power (kW)"),
+                dcc.Input(id="pmax", type="number", value=120.0, step=5, min=20, max=350, style={"width": "100%"}),
+                html.Small("Peak DC rate", style={"color": "#666"}),
+            ], style={"minWidth": "180px"}),
+        ], style={"display": "grid","gridTemplateColumns": "repeat(3, minmax(220px, 1fr))","gap": "12px","marginTop": "8px"}),
+
+        # Display / unit options
+        html.Div([
+            dcc.Checklist(
+                id="show_leg_details",
+                options=[{"label": "Show per-leg details", "value": "details"}],
+                value=["details"], inline=True
+            ),
+            dcc.RadioItems(
+                id="units",
+                options=[
+                    {"label": "km / kWh / %", "value": "metric"},
+                    {"label": "miles / kWh / %", "value": "imperial"}
+                ],
+                value="metric", inline=True,
+                style={"marginLeft": "16px"}
+            ),
+        ], style={"display": "flex","alignItems": "center","gap": "12px","flexWrap": "wrap"}),
+
+        html.Div([
+            html.Button("Optimise", id="simulate", n_clicks=0, style={"marginTop": "10px"}),
+            html.Button("Download KML", id="btn-kml", n_clicks=0, style={"marginLeft": "8px", "marginTop": "10px"}),
+        ], style={"display": "flex", "gap": "8px"}),
+
+        html.Div(id="status", style={"marginTop": "10px"}),
+        html.Div(id="explain", style={"marginTop": "10px", "whiteSpace": "pre-line"}),
+
+
+        # Map mode toggle
+        html.Div([
+            html.Label("Map mode"),
+            dcc.RadioItems(
+                id="map-mode",
+                options=[{"label": "2D (Folium)", "value": "2d"},
+                         {"label": "3D (beta)", "value": "3d"}],
+                value="2d",
+                inline=True
+            )
+        ], style={"marginTop": "8px"}),
+        dcc.Loading(
+            html.Iframe(
+                id="map",
+                srcDoc="<html><body style='font-family:sans-serif;padding:10px'>Loading…</body></html>",
+                style={"width": "100%","height": "620px","border": "1px solid #ddd","borderRadius": "8px"}
+            )
+        ),
+
+        html.Div(id="itinerary", style={"marginTop": "10px"}),
+    ]),
+    
     # Persistent storage + background refreshers
     dcc.Store(id="store-zones", data=preload_zones_json()),
     dcc.Store(id="overlay-refresh-token"),
     dcc.Store(id="store-route"),
     dcc.Download(id="dl-kml"),
-    dcc.Interval(id="init", interval=250, n_intervals=0, max_intervals=1)
+    dcc.Interval(id="init", interval=250, n_intervals=0, max_intervals=1),
 ])
 
 # -------------------------
@@ -1620,11 +1539,80 @@ def _bump_refresh(_n, tok):
     Input("btn-zones", "n_clicks"),
     prevent_initial_call=True
 )
+
 def _compute_zones(_n):
-    zones = compute_model_zones_for_points(gdf_ev)
+    zones = safe_compute_zones()
     try: zones.to_parquet("cache_model_zones.parquet", index=False)
     except Exception: pass
     return zones.to_json(orient="records")
+
+# Weather split
+@app.callback(
+    Output("weather-split", "children"),
+    Input("wales-location", "value"),
+    Input("wx-refresh", "n_intervals")
+)
+def _wx_split(loc, _n):
+    lat, lon = WALES_LOCS.get(loc, (51.60, -3.20))
+    data = get_weather(lat, lon)
+    prov = data.get("provider","?")
+    raw = data.get("raw") or {}
+
+    left_children = [html.H3(f"{loc} – Current ({prov})")]
+    if prov == "Open-Meteo":
+        cur = raw.get("current", {})
+        if cur:
+            left_children += [
+                html.Div(f"Temperature: {cur.get('temperature_2m','?')} °C"),
+                html.Div(f"Precipitation: {cur.get('precipitation','?')} mm"),
+                html.Div(f"Wind: {cur.get('wind_speed_10m','?')} m/s"),
+            ]
+    elif prov == "Met Office":
+        left_children += [html.Pre(json.dumps(raw, indent=2)[:1200])]
+    elif prov == "error":
+        left_children += [html.Div("Weather error: " + data.get("error",""))]
+
+    left = html.Div(style={"border":"1px solid #eee","borderRadius":"10px","padding":"10px"}, children=left_children)
+
+    try:
+        import plotly.graph_objects as go
+        if prov == "Open-Meteo":
+            hrs = raw.get("hourly", {})
+            times = hrs.get("time") or []
+            temps = hrs.get("temperature_2m") or []
+            pops  = hrs.get("precipitation_probability") or []
+            times = times[:24]; temps = temps[:24]; pops = pops[:24]
+            df2 = pd.DataFrame({"time": times, "temp": temps, "pop": pops})
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=df2["time"], y=df2["pop"], name="Precip %", yaxis="y2", opacity=0.5))
+            fig.add_trace(go.Scatter(x=df2["time"], y=df2["temp"], name="Temp °C"))
+            fig.update_layout(margin=dict(l=10,r=10,t=30,b=10), height=320,
+                              xaxis_title="", yaxis_title="Temp (°C)",
+                              yaxis2=dict(title="Precip (%)", overlaying="y", side="right"))
+        elif prov == "Met Office":
+            ts = _parse_metoffice_timeseries(raw)
+            fig = go.Figure()
+            if ts:
+                df2 = pd.DataFrame({"time": ts.get("time",[]), "temp": ts.get("temp",[]), "pop": ts.get("pop",[])})
+                if any(df2.get("pop", [])):
+                    fig.add_trace(go.Bar(x=df2["time"], y=df2["pop"], name="Precip %", yaxis="y2", opacity=0.5))
+                fig.add_trace(go.Scatter(x=df2["time"], y=df2["temp"], name="Temp °C"))
+                fig.update_layout(margin=dict(l=10,r=10,t=30,b=10), height=320,
+                                  xaxis_title="", yaxis_title="Temp (°C)",
+                                  yaxis2=dict(title="Precip (%)", overlaying="y", side="right"))
+            else:
+                fig.update_layout(title="Met Office: timeseries not found", height=320)
+        else:
+            import plotly.graph_objects as go
+            fig = go.Figure(); fig.update_layout(margin=dict(l=10,r=10,t=30,b=10), height=320)
+    except Exception as e:
+        import plotly.graph_objects as go
+        fig = go.Figure(); fig.update_layout(title=f"Weather chart error: {e}", height=320)
+
+    right = html.Div(style={"border":"1px solid #eee","borderRadius":"10px","padding":"10px"},
+                     children=[html.H3("Next 24h forecast"), dcc.Graph(figure=fig, config={"displayModeBar": False})])
+
+    return [left, right]
 
 @app.callback(
     Output("sla","value"), Output("slo","value"),
@@ -1696,12 +1684,13 @@ def _apply_vehicle_preset(cat, model):
     State("kwhkm","value"), State("pmax","value"),
     State("show_leg_details","value"),
     State("units","value"),
+    State("map-mode","value"),
     # Trigger once on load
     Input("init","n_intervals"),
 )
 def _update_map(countrys, country_like, op_vals, layers_vals, light_vals, zones_json, _tok,
                 sim_clicks, sla, slo, ela, elo, batt, si, sres, stgt, kwhkm, pmax,
-                show_leg_details, units, _init_n):
+                show_leg_details, units, map_mode, _init_n):
 
 
     light = "on" in (light_vals or [])
@@ -1722,7 +1711,7 @@ def _update_map(countrys, country_like, op_vals, layers_vals, light_vals, zones_
                                      "ZoneLabel": "Outside",
                                      "ZoneColor": ZONE_COLORS["Outside"]})
         else:
-            zones_df = compute_model_zones_for_points(gdf_ev)
+            zones_df = safe_compute_zones()
 
     d = d.merge(zones_df, on="ROW_ID", how="left")
     d["ZoneLabel"] = d["ZoneLabel"].fillna("Outside")
@@ -1773,12 +1762,18 @@ def _update_map(countrys, country_like, op_vals, layers_vals, light_vals, zones_
                     float(kwhkm), d if not d.empty else gdf_ev, flood_union_m, extreme=False
                 )
 
-                html_str = render_map_html_route(
-                    full_line=line, route_safe=safe_lines, route_risk=risk_lines,
-                    start=(float(sla), float(slo)), end=(float(ela), float(elo)),
-                    chargers=stops, all_chargers_df=None,
-                    animate=False, speed_kmh=45, show_live_backdrops=False
-                )
+                if (map_mode or "2d") == "3d":
+                    html_str = render_map_html_ev_3d(
+                        df_map=None, start=(float(sla), float(slo)), end=(float(ela), float(elo)),
+                        route_full=line, route_safe=safe_lines, route_risk=risk_lines
+                    )
+                else:
+                    html_str = render_map_html_route(
+                        full_line=line, route_safe=safe_lines, route_risk=risk_lines,
+                        start=(float(sla), float(slo)), end=(float(ela), float(elo)),
+                        chargers=stops, all_chargers_df=None,
+                        animate=False, speed_kmh=45, show_live_backdrops=False
+                    )
 
                 rows = [f"**Routing & charging plan** — RCSP on OSM road network; generalised cost ≈ {total_cost/60:.1f} min"]
                 if stops:
@@ -1825,12 +1820,18 @@ def _update_map(countrys, country_like, op_vals, layers_vals, light_vals, zones_
                 line, flood_union_m, buffer_m=ROUTE_BUFFER_M
             )
 
-            html_str = render_map_html_route(
-                full_line=line, route_safe=safe_lines, route_risk=risk_lines,
-                start=(float(sla), float(slo)), end=(float(ela), float(elo)),
-                chargers=stops, all_chargers_df=d,  # show all chargers plus planned ones
-                animate=False, speed_kmh=45, show_live_backdrops=False
-            )
+            if (map_mode or "2d") == "3d":
+                html_str = render_map_html_ev_3d(
+                    df_map=d, start=(float(sla), float(slo)), end=(float(ela), float(elo)),
+                    route_full=line, route_safe=safe_lines, route_risk=risk_lines
+                )
+            else:
+                html_str = render_map_html_route(
+                    full_line=line, route_safe=safe_lines, route_risk=risk_lines,
+                    start=(float(sla), float(slo)), end=(float(ela), float(elo)),
+                    chargers=stops, all_chargers_df=d,  # show all chargers plus planned ones
+                    animate=False, speed_kmh=45, show_live_backdrops=False
+                )
 
             msg = [f"**Routing & charging plan** — OSRM ({src}) • {dist_m/1000.0:.1f} km • {dur_s/3600.0:.2f} h"]
             if step_text:
@@ -1867,78 +1868,14 @@ def _update_map(countrys, country_like, op_vals, layers_vals, light_vals, zones_
             return render_map_html_ev(d, show_fraw, show_fmfp, show_live, show_ctx, light=light), itinerary_children, {}
 
     # EV overview
-    html_str = render_map_html_ev(d, show_fraw, show_fmfp, show_live, show_ctx, light=light)
+    if (map_mode or "2d") == "3d":
+        html_str = render_map_html_ev_3d(d)
+    else:
+        html_str = render_map_html_ev(d, show_fraw, show_fmfp, show_live, show_ctx, light=light)
     return html_str, itinerary_children, {}
+
+
  
-
-# Weather split
-@app.callback(
-    Output("weather-split", "children"),
-    Input("wales-location", "value"),
-    Input("wx-refresh", "n_intervals")
-)
-def _wx_split(loc, _n):
-    lat, lon = WALES_LOCS.get(loc, (51.60, -3.20))
-    data = get_weather(lat, lon)
-    prov = data.get("provider","?")
-    raw = data.get("raw") or {}
-
-    left_children = [html.H3(f"{loc} – Current ({prov})")]
-    if prov == "Open-Meteo":
-        cur = raw.get("current", {})
-        if cur:
-            left_children += [
-                html.Div(f"Temperature: {cur.get('temperature_2m','?')} °C"),
-                html.Div(f"Precipitation: {cur.get('precipitation','?')} mm"),
-                html.Div(f"Wind: {cur.get('wind_speed_10m','?')} m/s"),
-            ]
-    elif prov == "Met Office":
-        left_children += [html.Pre(json.dumps(raw, indent=2)[:1200])]
-    elif prov == "error":
-        left_children += [html.Div("Weather error: " + data.get("error",""))]
-
-    left = html.Div(style={"border":"1px solid #eee","borderRadius":"10px","padding":"10px"}, children=left_children)
-
-    try:
-        import plotly.graph_objects as go
-        if prov == "Open-Meteo":
-            hrs = raw.get("hourly", {})
-            times = hrs.get("time") or []
-            temps = hrs.get("temperature_2m") or []
-            pops  = hrs.get("precipitation_probability") or []
-            times = times[:24]; temps = temps[:24]; pops = pops[:24]
-            df2 = pd.DataFrame({"time": times, "temp": temps, "pop": pops})
-            fig = go.Figure()
-            fig.add_trace(go.Bar(x=df2["time"], y=df2["pop"], name="Precip %", yaxis="y2", opacity=0.5))
-            fig.add_trace(go.Scatter(x=df2["time"], y=df2["temp"], name="Temp °C"))
-            fig.update_layout(margin=dict(l=10,r=10,t=30,b=10), height=320,
-                              xaxis_title="", yaxis_title="Temp (°C)",
-                              yaxis2=dict(title="Precip (%)", overlaying="y", side="right"))
-        elif prov == "Met Office":
-            ts = _parse_metoffice_timeseries(raw)
-            fig = go.Figure()
-            if ts:
-                df2 = pd.DataFrame({"time": ts.get("time",[]), "temp": ts.get("temp",[]), "pop": ts.get("pop",[])})
-                if any(df2.get("pop", [])):
-                    fig.add_trace(go.Bar(x=df2["time"], y=df2["pop"], name="Precip %", yaxis="y2", opacity=0.5))
-                fig.add_trace(go.Scatter(x=df2["time"], y=df2["temp"], name="Temp °C"))
-                fig.update_layout(margin=dict(l=10,r=10,t=30,b=10), height=320,
-                                  xaxis_title="", yaxis_title="Temp (°C)",
-                                  yaxis2=dict(title="Precip (%)", overlaying="y", side="right"))
-            else:
-                fig.update_layout(title="Met Office: timeseries not found", height=320)
-        else:
-            import plotly.graph_objects as go
-            fig = go.Figure(); fig.update_layout(margin=dict(l=10,r=10,t=30,b=10), height=320)
-    except Exception as e:
-        import plotly.graph_objects as go
-        fig = go.Figure(); fig.update_layout(title=f"Weather chart error: {e}", height=320)
-
-    right = html.Div(style={"border":"1px solid #eee","borderRadius":"10px","padding":"10px"},
-                     children=[html.H3("Next 24h forecast"), dcc.Graph(figure=fig, config={"displayModeBar": False})])
-
-    return [left, right]
-
 # ============ KML Download ============
 @app.callback(
     Output("dl-kml", "data"),
@@ -2020,6 +1957,213 @@ def simulate(n, sla, slo, ela, elo, batt, si, sres, stgt, kwhkm, pmax, show_leg_
 # -------------------------
 # Run
 # -------------------------
+
+# === EU BEV Filter UI additions ===
+from dash import dash_table
+import pandas as pd
+
+# =========================
+# Weather (Open-Meteo default; Met Office optional)
+
+
+CATEGORY_OPTIONS = [
+    "A Mini","B Small","C Medium","D Large",
+    "E Executive","F Luxury","S Sport","M Multi-purpose","J SUV"
+]
+CAR_TYPES_BY_CATEGORY = {
+    "A Mini": ["City car hatchback"],
+    "B Small": ["Hatchback","Small sedan","Small wagon"],
+    "C Medium": ["Hatchback","Sedan","Estate/Wagon","Liftback"],
+    "D Large": ["Mid-size sedan","Estate/Wagon","Liftback"],
+    "E Executive": ["Executive sedan","Executive wagon","Fastback","Grand tourer"],
+    "F Luxury": ["Luxury sedan","Luxury fastback","Limousine"],
+    "S Sport": ["Sports coupe","Roadster","Performance hatch","Supercar","Hypercar"],
+    "M Multi-purpose": ["MPV","Van-based MPV","Camper MPV","Van-based people carrier"],
+    "J SUV": ["Crossover","SUV","Coupe-SUV","Off-roader"]
+}
+
+def detect_numeric_cols(df):
+    name_map = {c: str(c).lower().strip() for c in df.columns}
+    batt_candidates = [c for c, n in name_map.items() if "batt" in n or "kwh" in n]
+    range_candidates = [c for c, n in name_map.items() if "range" in n]
+    def _pick(cands):
+        for c in cands:
+            try:
+                _ = df[c].astype(float)
+                return c
+            except Exception:
+                continue
+        return None
+    return _pick(batt_candidates), _pick(range_candidates)
+
+def bounds(series, default_min, default_max):
+    try:
+        s = series.astype(float)
+        return float(s.min()), float(s.max())
+    except Exception:
+        return default_min, default_max
+
+# Load EU BEVs
+bev_df_clean = pd.read_csv("EU-BEVs.csv")  # (Ensure file is in same folder or use full path)
+batt_col, range_col = detect_numeric_cols(bev_df_clean)
+batt_min, batt_max = bounds(bev_df_clean[batt_col], 0.0, 120.0) if batt_col else (0.0, 120.0)
+range_min, range_max = bounds(bev_df_clean[range_col], 0.0, 900.0) if range_col else (0.0, 900.0)
+
+# Add to app.layout (insert at the right place for your UI; here as an example section)
+if hasattr(app.layout, "children") and isinstance(app.layout.children, list):
+    app.layout.children.append(html.H2("EU Battery Electric Vehicles (BEV) Filter"))
+
+from functools import lru_cache
+@lru_cache(maxsize=128)
+                                           
+def cached_get(url, headers_tuple=(), params_tuple=()):
+    headers = dict(headers_tuple) if headers_tuple else {}
+    params = dict(params_tuple) if params_tuple else {}
+    r = requests.get(url, headers=headers, params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def _ts():
+    return str(int(time.time()//300))
+
+METOFFICE_KEY = os.environ.get("METOFFICE_KEY", "").strip()
+METOFFICE_SITE_API = os.environ.get("METOFFICE_SITE_API", "").strip()  # optional
+
+def get_weather(lat=51.48, lon=-3.18):
+    try:
+        if METOFFICE_KEY and METOFFICE_SITE_API:
+            headers = (("apikey", METOFFICE_KEY),)
+            params = (("latitude", str(lat)), ("longitude", str(lon)),)
+            data = cached_get(METOFFICE_SITE_API, headers, params)
+            return {"provider":"Met Office", "raw": data}
+        else:
+            url = "https://api.open-meteo.com/v1/forecast"
+            params = (
+                ("latitude", str(lat)), ("longitude", str(lon)),
+                ("current", "temperature_2m,precipitation,wind_speed_10m"),
+                ("hourly", "temperature_2m,precipitation_probability,wind_speed_10m"),
+                ("timezone", "Europe/London"),
+                ("_ts", _ts()),
+            )
+            data = cached_get(url, (), params)
+            return {"provider":"Open-Meteo", "raw": data}
+    except Exception as e:
+        return {"provider":"error", "error": str(e)}
+
+def _parse_metoffice_timeseries(raw):
+    try:
+        feats = raw.get("features") or []
+        if feats and isinstance(feats, list):
+            ts = feats[0].get("properties", {}).get("timeSeries") or []
+            times = [r.get("time") for r in ts if "time" in r][:24]
+            temps = [r.get("screenTemperature") for r in ts][:24]
+            pops  = [r.get("precipitationProbability") or r.get("precipProb") for r in ts][:24]
+            if times and temps:
+                return {"time": times, "temp": temps, "pop": pops or [None]*len(times)}
+    except Exception:
+        pass
+    return {}
+
+app.layout.children.append(
+    html.Div([
+        html.Label("Battery-Electric Vehicles (BEV) filter"),
+        html.Div([
+            html.Label("Category"),
+            dcc.Dropdown(
+                id="bev-category-dd",
+                options=[{"label": c, "value": c} for c in CATEGORY_OPTIONS],
+                placeholder="Select segment (A–J)",
+                clearable=True,
+                style={"minWidth": "400px"}
+            ),
+            html.Label("Car Type"),
+            dcc.Dropdown(
+                id="bev-cartype-dd",
+                options=[],
+                placeholder="Select car type",
+                clearable=True,
+                disabled=True,
+                style={"minWidth": "400px"}
+            ),
+        ], style={"display": "flex", "gap": "8em"})
+    ])
+)
+
+
+app.layout.children.append(html.Br())
+
+app.layout.children.append(
+    html.Div([
+        html.Label(f"Battery capacity ({batt_col if batt_col else 'not found'})"),
+        dcc.RangeSlider(
+            id="bev-batt-slider",
+            min=batt_min, max=batt_max, value=[batt_min, batt_max],
+            marks=None, tooltip={"placement": "bottom"}, disabled=not bool(batt_col)
+        ),
+    ], style={"margin": "8px 0"})
+)
+
+app.layout.children.append(
+    html.Div([
+        html.Label(f"Range ({range_col if range_col else 'not found'})"),
+        dcc.RangeSlider(
+            id="bev-range-slider",
+            min=range_min, max=range_max, value=[range_min, range_max],
+            marks=None, tooltip={"placement": "bottom"}, disabled=not bool(range_col)
+        ),
+    ], style={"margin": "8px 0"})
+)
+
+app.layout.children.append(
+    html.Div([
+        dash_table.DataTable(
+            id="bev-table",
+            data=bev_df_clean.to_dict("records"),
+            columns=[{"name": c, "id": c} for c in bev_df_clean.columns],
+            page_size=10, sort_action="native", filter_action="native",
+            style_table={"overflowX": "auto"},
+            style_cell={"fontFamily": "system-ui, sans-serif", "fontSize": "13px"}
+        )
+    ])
+)
+
+@app.callback(
+    [Output("bev-cartype-dd", "options"), Output("bev-cartype-dd", "disabled")],
+    Input("bev-category-dd", "value")
+)
+def update_cartype_options(category):
+    if not category:
+        return [], True
+    opts = [{"label": t, "value": t} for t in CAR_TYPES_BY_CATEGORY.get(category, [])]
+    return opts, False
+
+@app.callback(
+    [Output("bev-table", "data"), Output("bev-table", "columns")],
+    [
+        Input("bev-category-dd", "value"),
+        Input("bev-cartype-dd", "value"),
+        Input("bev-batt-slider", "value"),
+        Input("bev-range-slider", "value"),
+    ]
+)
+def filter_bev_table(category, cartype, batt_range, range_range):
+    df = bev_df_clean.copy()
+    cat_col = next((c for c in df.columns if str(c).lower().strip() == "category"), None)
+    typ_col = next((c for c in df.columns if str(c).lower().strip() == "car type"), None)
+    if category and cat_col in df.columns:
+        df = df[df[cat_col] == category]
+    if cartype and typ_col in df.columns:
+        df = df[df[typ_col] == cartype]
+    if batt_col and batt_range:
+        lo, hi = float(batt_range[0]), float(batt_range[1])
+        df = df[pd.to_numeric(df[batt_col], errors="coerce").between(lo, hi)]
+    if range_col and range_range:
+        lo, hi = float(range_range[0]), float(range_range[1])
+        df = df[pd.to_numeric(df[range_col], errors="coerce").between(lo, hi)]
+    cols = [{"name": c, "id": c} for c in df.columns]
+    return df.to_dict("records"), cols
+
+# === END EU BEV Filter UI ===
 if __name__ == "__main__":
     app.run_server(debug=True)
 
@@ -2076,3 +2220,131 @@ def sensitivity_on_params(od_pairs, ev_params, chargers_df, flood_union_m, lambd
                     rows.append(dict(lambda_sec_per_km=lam, reserve=rs, kwh_per_km=k,
                                      success=succ, avg_time_s=avg_time/max(1,cnt), avg_risk_km=avg_risk/max(1,cnt)))
     return rows
+
+
+
+
+def render_map_html_ev_3d(df_map, start=None, end=None, route_full=None, route_safe=None, route_risk=None):
+    '''
+    Return an HTML string rendering a 3D (tilted) Mapbox map with chargers and optional route.
+    route_* can be shapely LineString objects (WGS84) or None.
+    '''
+    if not 'HAS_PYDECK' in globals() or not HAS_PYDECK:
+        return "<html><body style='font-family:sans-serif;padding:10px'>3D view requires pydeck. Install with: pip install pydeck</body></html>"
+
+    token = os.environ.get("MAPBOX_TOKEN") or os.environ.get("MAPBOX_ACCESS_TOKEN") or os.environ.get("MAPBOX_API_KEY") or ""
+    # Prepare chargers dataframe
+    df_plot = df_map.copy() if isinstance(df_map, (pd.DataFrame, gpd.GeoDataFrame)) else pd.DataFrame(columns=["Latitude","Longitude"])
+    for col in ("Latitude","Longitude"):
+        if col not in df_plot.columns:
+            df_plot[col] = None
+    df_plot["Operator"] = df_plot.get("Operator", "Charger")
+    df_plot["country"] = df_plot.get("country", "")
+    df_plot["AvailabilityLabel"] = df_plot.get("AvailabilityLabel", "")
+    df_plot["ZoneColor"] = df_plot.get("ZoneColor", "#2E7D32")
+
+    def _hex_to_rgb(h):
+        try:
+            h = str(h).lstrip("#")
+            return [int(h[i:i+2], 16) for i in (0, 2, 4)]
+        except Exception:
+            return [46, 125, 50]  # green fallback
+
+    df_plot["rgb"] = df_plot["ZoneColor"].apply(_hex_to_rgb)
+    df_plot["text"] = df_plot["Operator"].astype(str) + " (" + df_plot["country"].astype(str) + ") – " + df_plot["AvailabilityLabel"].astype(str)
+
+    # Scatter layer (chargers)
+    chargers_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=df_plot,
+        get_position="[Longitude, Latitude]",
+        get_fill_color="rgb",
+        get_line_color=[0, 0, 0],
+        line_width_min_pixels=1,
+        radius_min_pixels=3,
+        radius_max_pixels=8,
+        pickable=True,
+        stroked=True,
+    )
+
+    layers = [chargers_layer]
+
+    # Path helper
+    def _line_to_paths(line):
+        if line is None:
+            return []
+        coords = [(y, x) for x, y in getattr(line, "coords", [])]
+        return [coords] if coords else []
+
+    # Whole route faint
+    if route_full is not None:
+        paths = _line_to_paths(route_full)
+        if paths:
+            layers.append(pdk.Layer(
+                "PathLayer",
+                data=[{"path": paths[0]}],
+                get_path="path",
+                get_width=3,
+                get_color=[150, 150, 150],
+                opacity=0.5,
+            ))
+
+    # Safe segments (blue)
+    if route_safe:
+        for ln in route_safe:
+            pts = _line_to_paths(ln)
+            if not pts: 
+                continue
+            layers.append(pdk.Layer(
+                "PathLayer",
+                data=[{"path": pts[0]}],
+                get_path="path",
+                get_width=6,
+                get_color=[43, 140, 190],
+                opacity=0.9,
+            ))
+
+    # Risk segments (red)
+    if route_risk:
+        for ln in route_risk:
+            pts = _line_to_paths(ln)
+            if not pts:
+                continue
+            layers.append(pdk.Layer(
+                "PathLayer",
+                data=[{"path": pts[0]}],
+                get_path="path",
+                get_width=6,
+                get_color=[227, 26, 28],
+                opacity=0.95,
+            ))
+
+    # View state
+    if start and end:
+        lat_c = (float(start[0]) + float(end[0])) / 2.0
+        lon_c = (float(start[1]) + float(end[1])) / 2.0
+        zoom = 10
+    else:
+        lat_c, lon_c, zoom = 51.6, -3.2, 9
+
+    view_state = pdk.ViewState(latitude=lat_c, longitude=lon_c, zoom=zoom, pitch=50, bearing=15)
+
+    tooltip = {"html": "<b>{text}</b>", "style": {"color": "white", "fontSize": "12px"}}
+
+    deck = pdk.Deck(
+        layers=layers,
+        initial_view_state=view_state,
+        map_provider="mapbox",
+        map_style="mapbox://styles/mapbox/dark-v11",
+        tooltip=tooltip,
+        parameters={"cull": True},
+    )
+    # Attach token when provided (prevents errors if env var is missing)
+    try:
+        if token:
+            deck.mapbox_key = token
+    except Exception:
+        pass
+
+    return deck.to_html(as_string=True)
+
